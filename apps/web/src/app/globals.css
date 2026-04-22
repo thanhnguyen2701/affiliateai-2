@@ -1,0 +1,145 @@
+/* apps/web/src/app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+@layer base {
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    @apply bg-bg-0 text-tx-1 font-sans antialiased;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  /* Custom scrollbar */
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { @apply bg-transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-bdr-3 rounded; }
+}
+
+@layer components {
+  /* ── Buttons ─────────────────────────────────────────── */
+  .btn {
+    @apply inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+           text-xs font-semibold transition-all duration-150 cursor-pointer
+           disabled:opacity-40 disabled:cursor-not-allowed select-none;
+  }
+  .btn-primary {
+    @apply btn bg-brand text-white hover:bg-brand-light;
+  }
+  .btn-ghost {
+    @apply btn bg-bg-3 text-tx-2 border border-bdr-2 hover:bg-bg-4 hover:text-tx-1;
+  }
+  .btn-danger {
+    @apply btn bg-rose text-white hover:bg-rose-light;
+  }
+  .btn-success {
+    @apply btn bg-emerald text-white hover:bg-emerald-light;
+  }
+  .btn-lg {
+    @apply px-5 py-2.5 text-sm rounded-xl;
+  }
+  .btn-sm {
+    @apply px-2 py-1 text-[11px];
+  }
+  .btn-icon {
+    @apply w-7 h-7 p-0 flex items-center justify-center rounded-lg;
+  }
+
+  /* ── Inputs ──────────────────────────────────────────── */
+  .input {
+    @apply w-full bg-bg-3 border border-bdr-2 rounded-lg px-3 py-2
+           text-tx-1 text-xs placeholder-tx-4
+           focus:outline-none focus:border-brand focus:ring-1 focus:ring-brand/30
+           transition-colors duration-150;
+  }
+  .input-lg {
+    @apply input text-sm px-4 py-3 rounded-xl;
+  }
+  .select {
+    @apply input cursor-pointer appearance-none;
+  }
+  .textarea {
+    @apply input resize-none;
+  }
+  .label {
+    @apply block text-[11px] font-medium text-tx-3 mb-1.5 uppercase tracking-wide;
+  }
+
+  /* ── Cards / Panels ──────────────────────────────────── */
+  .card {
+    @apply bg-bg-2 border border-bdr-1 rounded-xl;
+  }
+  .card-hover {
+    @apply card hover:border-bdr-2 transition-colors cursor-pointer;
+  }
+  .panel-head {
+    @apply flex items-center gap-2 px-4 py-3 border-b border-bdr-1
+           text-xs font-bold text-tx-2;
+  }
+  .panel-body {
+    @apply p-4;
+  }
+
+  /* ── Badges ──────────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold;
+  }
+  .badge-green  { @apply badge bg-emerald-light/10 text-emerald-light; }
+  .badge-blue   { @apply badge bg-brand/10 text-brand-lighter; }
+  .badge-amber  { @apply badge bg-amber/10 text-amber-light; }
+  .badge-rose   { @apply badge bg-rose/10 text-rose-light; }
+  .badge-teal   { @apply badge bg-teal/10 text-teal-light; }
+
+  /* ── Sidebar nav ─────────────────────────────────────── */
+  .nav-item {
+    @apply flex items-center gap-2.5 px-3 py-2 mx-1.5 rounded-lg
+           text-tx-3 text-xs font-medium cursor-pointer
+           hover:bg-bg-3 hover:text-tx-2 transition-all duration-100
+           relative select-none;
+  }
+  .nav-item.active {
+    @apply bg-brand/10 text-brand-lighter;
+  }
+  .nav-item.active::before {
+    content: '';
+    @apply absolute -left-1.5 top-1/2 -translate-y-1/2 w-0.5 h-4 bg-brand rounded-r;
+  }
+
+  /* ── Metric card ─────────────────────────────────────── */
+  .metric-card {
+    @apply card p-4 relative overflow-hidden cursor-pointer
+           hover:border-bdr-2 hover:-translate-y-px transition-all duration-150;
+  }
+
+  /* ── Form group ──────────────────────────────────────── */
+  .form-group {
+    @apply flex flex-col gap-1.5 mb-4;
+  }
+
+  /* ── Divider ─────────────────────────────────────────── */
+  .divider {
+    @apply border-t border-bdr-1;
+  }
+
+  /* ── Status dot ──────────────────────────────────────── */
+  .status-dot {
+    @apply w-1.5 h-1.5 rounded-full;
+  }
+  .status-online { @apply status-dot bg-emerald-light shadow-[0_0_6px_theme(colors.emerald.light)]; }
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-gradient-to-r from-brand to-teal-light bg-clip-text text-transparent;
+  }
+  .bg-mesh {
+    background: radial-gradient(ellipse at 20% 50%, rgba(99,102,241,.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 20%, rgba(13,148,136,.06) 0%, transparent 50%);
+  }
+  .scrollbar-thin { scrollbar-width: thin; }
+  .no-scrollbar { scrollbar-width: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+}

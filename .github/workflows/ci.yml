@@ -1,0 +1,160 @@
+# .github/workflows/ci.yml
+# CI/CD Pipeline — chạy mỗi push/PR
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── Job 1: Test ────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    
+    env:
+      NODE_ENV: test
+      # Dùng fake values cho test — không phải real API keys
+      SUPABASE_URL: https://test.supabase.co
+      SUPABASE_SERVICE_KEY: test-service-key
+      SUPABASE_ANON_KEY: test-anon-key
+      CAKEAI_API_KEY: test-cakeai-key
+      CAKEAI_BASE_URL: https://api.cakeai.vn/v1
+      CAKEAI_ORCHESTRATOR_ID: ag_test_orch
+      CAKEAI_CONTENT_ID: ag_test_content
+      CAKEAI_SOCIAL_ID: ag_test_social
+      CAKEAI_OFFER_ID: ag_test_offer
+      CAKEAI_ANALYST_ID: ag_test_analyst
+      CAKEAI_ENGAGE_ID: ag_test_engage
+      CAKEAI_RAG_ID: ag_test_rag
+      CAKEAI_EVAL_ID: ag_test_eval
+      CAKEAI_SCHEDULER_ID: ag_test_scheduler
+      JWT_SECRET: test-jwt-secret-64-chars-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/api/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/api
+        run: npm ci
+
+      - name: Type check
+        working-directory: apps/api
+        run: npx tsc --noEmit
+
+      - name: Run unit tests
+        working-directory: apps/api
+        run: npm run test:unit -- --reporter=verbose
+
+      - name: Run integration tests
+        working-directory: apps/api
+        run: npm run test:integration -- --reporter=verbose
+
+      - name: Run smoke tests (mocked)
+        working-directory: apps/api
+        run: npm run test:smoke -- --reporter=verbose
+
+  # ─── Job 2: Build ────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm', cache-dependency-path: 'apps/api/package-lock.json' }
+
+      - name: Install
+        working-directory: apps/api
+        run: npm ci
+
+      - name: Build TypeScript
+        working-directory: apps/api
+        run: npx tsc --project tsconfig.json
+
+      - name: Build Docker image
+        if: github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./apps/api
+          push: false    # Chỉ build, không push trong job này
+          tags: affiliateai-api:${{ github.sha }}
+
+  # ─── Job 3: Deploy (main branch only) ────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production   # Cần approve trong GitHub Settings
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy API to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"serviceId":"${{ secrets.RAILWAY_SERVICE_ID }}"}' \
+            https://backboard.railway.app/graphql/v2 \
+            --data '{"query":"mutation { deploymentRedeploy(id: \"${{ secrets.RAILWAY_DEPLOYMENT_ID }}\") { id status } }"}'
+
+      - name: Wait for deploy
+        run: sleep 30
+
+      - name: Run smoke tests on production
+        env:
+          API_BASE_URL: ${{ secrets.PROD_API_URL }}
+          CAKEAI_API_KEY: ${{ secrets.CAKEAI_API_KEY }}
+          CAKEAI_CONTENT_ID: ${{ secrets.CAKEAI_CONTENT_ID }}
+          CAKEAI_EVAL_ID: ${{ secrets.CAKEAI_EVAL_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        working-directory: apps/api
+        run: |
+          npm ci
+          npm run test:smoke
+
+      - name: Health check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.PROD_API_URL }}/health)
+          echo "Health check status: $STATUS"
+          [ "$STATUS" = "200" ] || exit 1
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ Deploy thành công: ${{ github.sha }} | ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🚨 Deploy thất bại: ${{ github.sha }} | ${{ github.actor }} | Check logs!"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
