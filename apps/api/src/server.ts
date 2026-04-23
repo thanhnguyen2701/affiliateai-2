@@ -1,18 +1,69 @@
 // apps/api/src/server.ts
 // Entry point — Fastify server với tất cả routes và plugins
 
+import 'openai/shims/node';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import multipart from '@fastify/multipart';
 import * as Sentry from '@sentry/node';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   healthRoutes, authRoutes, agentRoutes,
   visualRoutes, profileRoutes, performanceRoutes,
 } from './routes/index.js';
 import { authenticate, errorHandler } from './middleware/index.js';
 import { inngest, scheduledFunctions } from './jobs/scheduler.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+function parseEnvFile(content: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const equalsIndex = line.indexOf('=');
+    if (equalsIndex <= 0) continue;
+
+    const key = line.slice(0, equalsIndex).trim();
+    let value = line.slice(equalsIndex + 1).trim();
+
+    if (
+      (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    parsed[key] = value;
+  }
+
+  return parsed;
+}
+
+function loadLocalEnv(): void {
+  const candidates = [
+    resolve(__dirname, '..', '.env.local'),
+    resolve(__dirname, '..', '..', '..', '.env.local'),
+  ];
+
+  for (const filePath of candidates) {
+    if (!existsSync(filePath)) continue;
+
+    const parsed = parseEnvFile(readFileSync(filePath, 'utf8'));
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!process.env[key]) process.env[key] = value;
+    }
+  }
+}
+
+loadLocalEnv();
 
 // ─── Init Sentry trước khi làm gì khác ────────────────────────────────────────
 if (process.env.SENTRY_DSN) {

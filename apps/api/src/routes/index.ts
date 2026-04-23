@@ -2,12 +2,34 @@
 // Tất cả API routes
 
 import type { FastifyInstance } from 'fastify';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { extname, resolve } from 'node:path';
 import { z } from 'zod';
 import { orchestrate } from '../agents/index.js';
 import { memoryService } from '../services/memory/memory-service.js';
 import { getSupabase } from '../lib/supabase.js';
 import { visualQueue } from '../services/visual/visual-queue.js';
 import type { Platform, AffiliateNetwork } from '../../../packages/shared/src/types.js';
+
+function multipartFieldValues(input: unknown): string[] {
+  if (Array.isArray(input)) return input.flatMap(multipartFieldValues);
+  if (!input || typeof input !== 'object') return [];
+  const value = (input as { value?: unknown }).value;
+  if (Array.isArray(value)) return value.map(item => String(item));
+  if (value === undefined || value === null) return [];
+  return [String(value)];
+}
+
+function extensionFromMime(mimeType: string): string {
+  if (mimeType.includes('png')) return '.png';
+  if (mimeType.includes('webp')) return '.webp';
+  if (mimeType.includes('jpeg') || mimeType.includes('jpg')) return '.jpg';
+  if (mimeType.includes('mp4')) return '.mp4';
+  if (mimeType.includes('quicktime')) return '.mov';
+  return '';
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HEALTH
@@ -193,6 +215,60 @@ export async function agentRoutes(app: FastifyInstance) {
 // ═══════════════════════════════════════════════════════════════════════════════
 export async function visualRoutes(app: FastifyInstance) {
   const db = getSupabase();
+
+  app.post('/api/visual/upload', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const userId = (req as any).userId as string;
+    const file = await req.file();
+
+    if (!file) {
+      return reply.status(400).send({ success: false, error: { code: 'file_required', message: 'Cần upload file ảnh hoặc video' } });
+    }
+
+    const requestedPipeline = String((file.fields?.pipeline as { value?: unknown } | undefined)?.value ?? '').toUpperCase();
+    const pipeline = file.mimetype.startsWith('video/') ? 'C' : (requestedPipeline || 'A');
+    const platforms = multipartFieldValues(file.fields?.platforms);
+    const niche = String((file.fields?.niche as { value?: unknown } | undefined)?.value ?? '');
+
+    const { data: user } = await db.from('users').select('plan').eq('id', userId).single();
+    if (user?.plan === 'free') {
+      return reply.status(403).send({ success: false, error: { code: 'plan_required', message: 'Visual AI cần gói Starter trở lên' } });
+    }
+
+    const buffer = await file.toBuffer();
+    const originalExt = extname(file.filename ?? '').toLowerCase();
+    const ext = originalExt || extensionFromMime(file.mimetype) || (pipeline === 'C' ? '.mp4' : '.jpg');
+    const tempDir = resolve(process.cwd(), '.tmp', 'visual');
+    mkdirSync(tempDir, { recursive: true });
+    const sourcePath = resolve(tempDir, `${userId}_${Date.now()}_${randomUUID().slice(0, 8)}${ext}`);
+    await writeFile(sourcePath, buffer);
+
+    const { data: job, error: jobError } = await db.from('visual_jobs').insert({
+      user_id: userId,
+      pipeline,
+      status: 'queued',
+      source_type: pipeline === 'C' ? 'video_upload' : 'photo_upload',
+      source_url: null,
+      product_info: niche ? { niche } : {},
+    }).select().single();
+
+    if (jobError || !job?.id) {
+      return reply.status(500).send({
+        success: false,
+        error: { code: 'job_create_failed', message: jobError?.message ?? 'Không tạo được visual job' },
+      });
+    }
+
+    visualQueue.add(job.id, userId, {
+      source_path: sourcePath,
+      platforms: platforms.length > 0 ? platforms : ['tiktok', 'facebook', 'instagram'],
+      pipeline,
+    }).catch(console.error);
+
+    return {
+      success: true,
+      data: { job_id: job.id, status: 'queued', message: 'Đã upload thành công, đang xử lý' },
+    };
+  });
 
   // POST /api/visual/from-url — Pipeline B: Shopee/Lazada URL
   app.post('/api/visual/from-url', { preHandler: [app.authenticate] }, async (req, reply) => {

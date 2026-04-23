@@ -1,6 +1,7 @@
 // apps/api/src/services/memory/rag-service.ts
 // RAG: embed documents → store vectors → semantic search
 
+import 'openai/shims/node';
 import OpenAI from 'openai';
 import { getSupabase } from '../../lib/supabase.js';
 import { withRetry } from '../../lib/resilience.js';

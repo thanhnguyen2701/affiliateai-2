@@ -4,7 +4,20 @@
 import { createClient } from './supabase/client';
 import type { AgentOutput, ContentBundle, VisualAssets } from '../types';
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+function resolveApiBase(): string {
+  const configured = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (configured && !/^https?:\/\/localhost(?::\d+)?$/i.test(configured)) return configured;
+
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname } = window.location;
+    const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
+    return `${protocol}//${hostname}:${isLocalHost ? '3001' : '3001'}`;
+  }
+
+  return configured || 'http://localhost:3001';
+}
+
+const BASE = resolveApiBase();
 
 // ─── Auth header ───────────────────────────────────────────────────────────────
 async function authHeader(): Promise<Record<string, string>> {
@@ -101,12 +114,19 @@ export const visualAPI = {
   getHistory: (): Promise<VisualJob[]> =>
     apiFetch('/api/visual/history'),
 
-  uploadPhoto: async (file: File): Promise<{ job_id: string }> => {
+  uploadPhoto: async (
+    file: File,
+    options: { platforms?: string[]; niche?: string } = {}
+  ): Promise<{ job_id: string }> => {
     const headers = await authHeader();
     delete headers['Content-Type'];
     const form = new FormData();
-    form.append('file', file);
     form.append('pipeline', 'A');
+    form.append('file', file);
+    for (const platform of options.platforms ?? []) {
+      form.append('platforms', platform);
+    }
+    if (options.niche) form.append('niche', options.niche);
     const res = await fetch(`${BASE}/api/visual/upload`, { method: 'POST', headers, body: form });
     if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
     const data = await res.json();

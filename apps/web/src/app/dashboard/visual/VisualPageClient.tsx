@@ -302,7 +302,7 @@ function PipelineA({ platforms, brandKit, onJobCreated }: {
     if (!file) return;
     setUploading(true);
     try {
-      const result = await visualAPI.uploadPhoto(file);
+      const result = await visualAPI.uploadPhoto(file, { platforms, niche });
       // Build optimistic job
       const job: VisualJob = {
         id: result.job_id,
