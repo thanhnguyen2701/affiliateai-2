@@ -104,6 +104,19 @@ export async function authRoutes(app: FastifyInstance) {
     const { data, error } = await db.auth.signInWithPassword({ email, password });
     if (error) return reply.status(401).send({ success: false, error: { code: 'invalid_credentials', message: 'Email hoặc mật khẩu không đúng' } });
 
+    await db.from('users').upsert({
+      id: data.user.id,
+      email: data.user.email ?? email,
+      plan: 'free',
+      credits_total: 10,
+      credits_used: 0,
+    }, {
+      onConflict: 'id',
+      ignoreDuplicates: true,
+    });
+    await db.from('affiliate_profiles').upsert({ user_id: data.user.id });
+    await db.from('brand_kits').upsert({ user_id: data.user.id });
+
     // Update last_seen
     await db.from('users').update({ last_seen_at: new Date().toISOString() })
       .eq('id', data.user.id);
@@ -228,6 +241,9 @@ export async function visualRoutes(app: FastifyInstance) {
     const pipeline = file.mimetype.startsWith('video/') ? 'C' : (requestedPipeline || 'A');
     const platforms = multipartFieldValues(file.fields?.platforms);
     const niche = String((file.fields?.niche as { value?: unknown } | undefined)?.value ?? '');
+    const subStyle = String((file.fields?.sub_style as { value?: unknown } | undefined)?.value ?? '');
+    const clipDurationValue = String((file.fields?.clip_duration as { value?: unknown } | undefined)?.value ?? '');
+    const clipDuration = Number(clipDurationValue);
 
     const { data: user } = await db.from('users').select('plan').eq('id', userId).single();
     if (user?.plan === 'free') {
@@ -246,9 +262,13 @@ export async function visualRoutes(app: FastifyInstance) {
       user_id: userId,
       pipeline,
       status: 'queued',
-      source_type: pipeline === 'C' ? 'video_upload' : 'photo_upload',
+      source_type: pipeline === 'C' ? 'raw_video' : 'photo_upload',
       source_url: null,
-      product_info: niche ? { niche } : {},
+      product_info: {
+        ...(niche ? { niche } : {}),
+        ...(subStyle ? { subStyle } : {}),
+        ...(Number.isFinite(clipDuration) && clipDuration > 0 ? { clipDuration } : {}),
+      },
     }).select().single();
 
     if (jobError || !job?.id) {
@@ -262,6 +282,9 @@ export async function visualRoutes(app: FastifyInstance) {
       source_path: sourcePath,
       platforms: platforms.length > 0 ? platforms : ['tiktok', 'facebook', 'instagram'],
       pipeline,
+      ...(niche ? { niche } : {}),
+      ...(subStyle ? { subStyle } : {}),
+      ...(Number.isFinite(clipDuration) && clipDuration > 0 ? { clipDuration } : {}),
     }).catch(console.error);
 
     return {

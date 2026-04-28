@@ -15,6 +15,7 @@ import {
   healthRoutes, authRoutes, agentRoutes,
   visualRoutes, profileRoutes, performanceRoutes,
 } from './routes/index.js';
+import { paymentRoutes, knowledgeRoutes, offersRoutes } from './routes/payment.js';
 import { authenticate, errorHandler } from './middleware/index.js';
 import { inngest, scheduledFunctions } from './jobs/scheduler.js';
 
@@ -137,6 +138,9 @@ async function buildServer() {
   await app.register(visualRoutes);
   await app.register(profileRoutes);
   await app.register(performanceRoutes);
+  await app.register(paymentRoutes);
+  await app.register(knowledgeRoutes);
+  await app.register(offersRoutes);
 
   // ── Inngest endpoint (webhook từ Inngest cloud) ────────────────────────────
   if (process.env.INNGEST_EVENT_KEY) {
@@ -177,7 +181,7 @@ async function start() {
     app.log.info('');
     app.log.info('╔══════════════════════════════════════════╗');
     app.log.info('║   🤖 AffiliateAI API — Running           ║');
-    app.log.info(`║   http://localhost:${port}                    ║`);
+    app.log.info(`║   http://192.168.1.149:${port}                ║`);
     app.log.info('╚══════════════════════════════════════════╝');
     app.log.info('');
     app.log.info(`  ENV     : ${process.env.NODE_ENV ?? 'development'}`);

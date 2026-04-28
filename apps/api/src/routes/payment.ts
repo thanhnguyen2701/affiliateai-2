@@ -7,10 +7,12 @@ import {
 } from '../services/credits.js';
 import { ingestDocument, ingestProductUrl } from '../services/memory/rag-service.js';
 import { getTopOffersForUser } from '../services/integrations/offer-aggregator.js';
+import { getSupabase } from '../lib/supabase.js';
 import type { Plan, AffiliateNetwork, Niche } from '../../../packages/shared/src/types.js';
 
 // ─── Payment Routes ────────────────────────────────────────────────────────────
 export async function paymentRoutes(app: FastifyInstance) {
+  const db = getSupabase();
 
   // POST /api/payment/create — tạo đơn hàng ZaloPay
   app.post('/api/payment/create', { preHandler: [app.authenticate] }, async (req, reply) => {
@@ -36,6 +38,66 @@ export async function paymentRoutes(app: FastifyInstance) {
         amount:       PLAN_PRICES[plan as Plan],
         plan,
       }
+    };
+  });
+
+  // POST /api/payment/upgrade-starter — bypass thanh toán, nâng thẳng lên Starter
+  app.post('/api/payment/upgrade-starter', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const userId = (req as any).userId as string;
+    const userEmail = (req as any).userEmail as string | undefined;
+    let { data: user } = await db.from('users').select('plan').eq('id', userId).single();
+
+    if (!user) {
+      await db.from('users').upsert({
+        id: userId,
+        email: userEmail ?? `${userId}@local.invalid`,
+        plan: 'free',
+        credits_total: 10,
+        credits_used: 0,
+      });
+      await db.from('affiliate_profiles').upsert({ user_id: userId });
+      await db.from('brand_kits').upsert({ user_id: userId });
+
+      const { data: createdUser } = await db.from('users').select('plan').eq('id', userId).single();
+      user = createdUser;
+    }
+
+    if (!user) {
+      return reply.status(404).send({
+        success: false,
+        error: { code: 'user_not_found', message: 'Không tìm thấy người dùng' },
+      });
+    }
+
+    if (user.plan === 'starter') {
+      return {
+        success: true,
+        data: {
+          plan: 'starter',
+          credits_total: 100,
+          credits_used: 0,
+          message: 'Tài khoản đã ở gói Starter',
+        },
+      };
+    }
+
+    if (user.plan !== 'free') {
+      return reply.status(400).send({
+        success: false,
+        error: { code: 'starter_upgrade_blocked', message: 'Chỉ hỗ trợ nâng nhanh từ gói Free lên Starter' },
+      });
+    }
+
+    await handlePaymentSuccess(userId, 'starter');
+
+    return {
+      success: true,
+      data: {
+        plan: 'starter',
+        credits_total: 100,
+        credits_used: 0,
+        message: 'Đã nâng cấp lên Starter',
+      },
     };
   });
 

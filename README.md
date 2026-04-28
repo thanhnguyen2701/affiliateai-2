@@ -65,9 +65,9 @@ npm install
 npm run dev
 ```
 
-Server chạy tại: `http://localhost:3001`
+Server chạy tại: `http://192.168.1.149:3001`
 
-Kiểm tra: `GET http://localhost:3001/health`
+Kiểm tra: `GET http://192.168.1.149:3001/health`
 
 ### Bước 5 — Test
 
@@ -148,7 +148,7 @@ Nhận mọi message, detect intent (12 loại), dispatch đến agent phù hợ
 
 ```bash
 # Example request
-curl -X POST http://localhost:3001/api/agent/chat \
+curl -X POST http://192.168.1.149:3001/api/agent/chat \
   -H "Authorization: Bearer YOUR_JWT" \
   -H "Content-Type: application/json" \
   -d '{"message": "Viết review TikTok cho kem dưỡng da Innisfree https://shp.ee/xxx"}'

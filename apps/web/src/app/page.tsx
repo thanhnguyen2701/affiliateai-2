@@ -1,5 +1,6 @@
 // apps/web/src/app/page.tsx — Public landing page
 
+import clsx from 'clsx';
 import Link from 'next/link';
 
 export default function LandingPage() {

@@ -5,9 +5,11 @@ import { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
+import { visualAPI } from '@/lib/api';
 import type { VisualJob } from '@/app/dashboard/visual/VisualPageClient';
 
 interface Props {
+  platforms: string[];
   onJobCreated: (j: VisualJob) => void;
 }
 
@@ -23,7 +25,7 @@ const CLIP_DURATIONS = [
   { v:60,  label:'60 giây' },
 ];
 
-export default function PipelineC({ onJobCreated }: Props) {
+export default function PipelineC({ platforms, onJobCreated }: Props) {
   const [file,         setFile]         = useState<File | null>(null);
   const [preview,      setPreview]      = useState<string | null>(null);
   const [videoDuration,setVideoDuration]= useState<number>(0);
@@ -33,7 +35,7 @@ export default function PipelineC({ onJobCreated }: Props) {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     accept: { 'video/*': ['.mp4', '.mov', '.avi', '.webm', '.mkv'] },
-    maxSize: 500 * 1024 * 1024,  // 500MB
+    maxSize: 100 * 1024 * 1024,
     multiple: false,
     onDrop: useCallback((accepted: File[]) => {
       const f = accepted[0];
@@ -70,11 +72,13 @@ export default function PipelineC({ onJobCreated }: Props) {
 
     // Simulate upload — in production: call visualAPI.uploadVideo(file)
     try {
-      await new Promise(r => setTimeout(r, 1000));
-
-      const mockJobId = 'job_' + Math.random().toString(36).slice(2);
+      const result = await visualAPI.uploadVideo(file, {
+        platforms,
+        subStyle,
+        clipDuration,
+      });
       const job: VisualJob = {
-        id:           mockJobId,
+        id:           result.job_id,
         pipeline:     'C',
         status:       'queued',
         source_type:  'raw_video',

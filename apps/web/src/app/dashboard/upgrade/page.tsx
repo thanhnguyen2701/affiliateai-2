@@ -2,6 +2,7 @@
 // apps/web/src/app/dashboard/upgrade/page.tsx
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
 import { paymentAPI } from '@/lib/api';
@@ -78,8 +79,11 @@ const FAQ = [
   { q:'Có được hoàn tiền không?', a:'Hoàn tiền trong 7 ngày đầu nếu không hài lòng với dịch vụ.' },
 ];
 
+const priceFormatter = new Intl.NumberFormat('vi-VN');
+
 export default function UpgradePage() {
-  const { plan: currentPlan } = useUserStore();
+  const router = useRouter();
+  const { plan: currentPlan, setUser } = useUserStore();
   const [loading, setLoading] = useState<string | null>(null);
   const [annual,  setAnnual]  = useState(false);
   const [openFaq, setOpenFaq] = useState<number | null>(null);
@@ -88,10 +92,24 @@ export default function UpgradePage() {
     if (planId === currentPlan) { toast('Bạn đang dùng gói này rồi!'); return; }
     setLoading(planId);
     try {
+      if (planId === 'starter') {
+        const result = await paymentAPI.upgradeStarter();
+        setUser({
+          plan: result.plan,
+          creditsTotal: result.credits_total,
+          creditsUsed: result.credits_used,
+        });
+        toast.success(result.message || 'Da nang cap len Starter');
+        router.push('/dashboard');
+        router.refresh();
+        return;
+      }
+
       const result = await paymentAPI.createOrder(planId);
       window.location.href = result.order_url;
     } catch (err) {
-      toast.error('Không thể tạo đơn thanh toán: ' + (err as Error).message);
+      const action = planId === 'starter' ? 'nâng cấp Starter' : 'tạo đơn thanh toán';
+      toast.error(`Không thể ${action}: ${(err as Error).message}`);
     } finally { setLoading(null); }
   }
 
@@ -165,13 +183,13 @@ export default function UpgradePage() {
                 <div className="mb-4">
                   <div className="flex items-baseline gap-1">
                     <span className="text-3xl font-extrabold" style={{ color: plan.color }}>
-                      {price.toLocaleString()}đ
+                      {priceFormatter.format(price)}đ
                     </span>
                     <span className="text-xs text-tx-4">/tháng</span>
                   </div>
                   {annual && (
                     <p className="text-[10px] text-tx-4 line-through">
-                      {plan.price.toLocaleString()}đ/tháng
+                      {priceFormatter.format(plan.price)}đ/tháng
                     </p>
                   )}
                   <p className="text-[11px] text-tx-3 mt-0.5">

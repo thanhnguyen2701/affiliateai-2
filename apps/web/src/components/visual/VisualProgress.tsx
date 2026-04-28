@@ -169,7 +169,7 @@ export default function VisualProgress({ job, pipeline }: Props) {
           <span className="text-lg">❌</span>
           <div className="flex-1">
             <p className="text-xs font-bold text-rose-light">Xử lý thất bại</p>
-            <p className="text-[11px] text-tx-3">Kiểm tra URL/file và thử lại</p>
+            <p className="text-[11px] text-tx-3">{job.error_msg || 'Kiểm tra URL/file và thử lại'}</p>
           </div>
           <button className="btn btn-ghost btn-sm text-[11px]" onClick={() => window.location.reload()}>
             Thử lại

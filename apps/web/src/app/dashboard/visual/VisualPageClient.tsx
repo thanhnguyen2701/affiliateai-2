@@ -19,6 +19,7 @@ export interface VisualJob {
   id: string;
   pipeline: Pipeline;
   status: 'queued' | 'processing' | 'done' | 'failed';
+  error_msg?: string;
   source_type?: string;
   source_url?: string;
   product_info: Record<string, unknown>;
@@ -93,7 +94,7 @@ export default function VisualPageClient({ initialJobs, brandKit }: Props) {
             toast.success(`✅ Bộ ảnh "${job.pipeline === 'C' ? 'video' : 'ảnh'}" đã sẵn sàng!`);
             setActiveJobId(null);
           } else if (updated.status === 'failed') {
-            toast.error('❌ Tạo ảnh thất bại. Vui lòng thử lại.');
+            toast.error(`❌ ${updated.error_msg || 'Tạo ảnh thất bại. Vui lòng thử lại.'}`);
             setActiveJobId(null);
           }
         } catch {/* ignore poll errors */}
@@ -225,6 +226,7 @@ export default function VisualPageClient({ initialJobs, brandKit }: Props) {
           )}
           {activePipeline === 'C' && (
             <PipelineC
+              platforms={selectedPlatforms}
               onJobCreated={onJobCreated}
             />
           )}
