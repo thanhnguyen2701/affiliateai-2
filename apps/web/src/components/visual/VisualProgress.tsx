@@ -13,18 +13,18 @@ interface Props {
 const STEPS: Record<Pipeline, string[]> = {
   B: [
     'Đang crawl sản phẩm từ Shopee...',
-    'GPT-4o Vision đang chọn ảnh đẹp nhất...',
+    'GPT-5.5 Vision đang chọn ảnh đẹp nhất...',
     'Remove.bg xóa nền ảnh...',
-    'DALL-E 3 đang tạo background lifestyle...',
-    'Ghép ảnh và thêm text overlay...',
+    'GPT Image 2 tạo scene lifestyle...',
+    'Thêm headline, giá và CTA...',
     'Đang export đa format...',
   ],
   A: [
     'Đang nhận ảnh upload...',
     'Remove.bg xóa nền sản phẩm...',
     'Real-ESRGAN upscale chất lượng...',
-    'DALL-E 3 tạo background theo niche...',
-    'Ghép ảnh và thêm text overlay...',
+    'GPT Image tạo scene lifestyle theo niche...',
+    'Tối ưu bố cục và vùng trống cho text...',
     'Đang export đa format...',
   ],
   C: [

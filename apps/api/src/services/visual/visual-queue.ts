@@ -171,10 +171,8 @@ async function runPipelineB(
   
   await Promise.all(selectedPlatforms.map(async (platform) => {
     const creative = buildCreativeDirection(niche, platform, product);
-    const bgPrompt  = buildBgPrompt(niche, platform, product, creative);
-    const bgBuffer  = await generateBackground(bgPrompt, platform);
-    const composited = await compositeImages(bgBuffer, noBg, platform, creative);
-    const withText  = await addCreativeTextOverlay(composited, platform, {
+    const scene = await generatePhotorealisticProductScene(noBg, niche, platform, product, creative);
+    const withText = await addCreativeTextOverlay(scene, platform, {
       name:    product.name,
       price:   product.price,
       rating:  product.rating,
@@ -235,7 +233,7 @@ async function runPipelineC(
     clipDuration
   );
   
-  // Step 2: Find best 45s highlight với GPT-4o
+  // Step 2: Find best highlight with the configured OpenAI video planner.
   
   // Step 3: Cut clip
   await cutVideoClip(videoPath, highlight.start, highlight.end, clipPath, hasAudio);
@@ -339,11 +337,14 @@ async function upscaleImage(buffer: Buffer): Promise<Buffer> {
 }
 
 async function generateBackground(prompt: string, platform: string): Promise<Buffer> {
-  const sizeMap: Record<string, '1024x1024' | '1792x1024' | '1024x1792'> = {
-    tiktok: '1024x1792', instagram_story: '1024x1792',
-    facebook: '1792x1024', youtube: '1792x1024',
+  const sizeMap: Record<string, '1024x1024' | '1536x1024' | '1024x1536'> = {
+    tiktok: '1024x1536', instagram_story: '1024x1536',
+    facebook: '1536x1024', youtube: '1536x1024',
+    zalo: '1536x1024',
   };
   const size = sizeMap[platform] ?? '1024x1024';
+  const model = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2';
+  const quality = process.env.OPENAI_IMAGE_QUALITY || 'high';
 
   if (!process.env.OPENAI_API_KEY) {
     return generateFallbackBackground(platform);
@@ -353,10 +354,13 @@ async function generateBackground(prompt: string, platform: string): Promise<Buf
     const { default: OpenAI } = await import('openai');
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const res = await withTimeout(
-      () => openai.images.generate({ model: 'dall-e-3', prompt, size, quality: 'standard', n: 1 }),
+      () => openai.images.generate({ model, prompt, size, quality, n: 1 } as any),
       PIPELINE_A_BG_TIMEOUT_MS,
       `Background generation timed out after ${PIPELINE_A_BG_TIMEOUT_MS}ms`
     );
+    const base64Image = res.data?.[0]?.b64_json;
+    if (base64Image) return Buffer.from(base64Image, 'base64');
+
     const url = res.data?.[0]?.url;
     if (!url) throw new Error('OpenAI image response missing URL');
     return downloadBuffer(url);
@@ -381,6 +385,34 @@ async function generatePipelineAAsset(productBuffer: Buffer, niche: string, plat
   }
 }
 
+async function generatePhotorealisticProductScene(
+  productBuffer: Buffer,
+  niche: string,
+  platform: string,
+  product: { name?: string; price?: number; rating?: number; sold?: number; discount?: number },
+  creative: CreativeDirection
+): Promise<Buffer> {
+  try {
+    return await generateImageFromCutout({
+      cutoutBuffer: productBuffer,
+      niche,
+      platform,
+      productName: product.name ? shortProductName(product.name) : undefined,
+      marketingContext: buildPipelineBMarketingContext(product, niche, platform),
+      creativeTheme: creative.theme,
+      colorDirection: `${creative.palette.primary}, ${creative.palette.secondary}, ${creative.palette.accent}`,
+      overlayTextIntent: `${creative.badge}; headline "${creative.headline}"; subline "${creative.subline}"; CTA "${creative.cta}"`,
+      productPlacement: creative.productPlacement,
+      textZone: creative.textZone,
+    });
+  } catch (error) {
+    console.warn(`[Visual] Photorealistic image edit fallback for ${platform}: ${(error as Error).message}`);
+    const bgPrompt = buildBgPrompt(niche, platform, product, creative);
+    const bgBuffer = await generateBackground(bgPrompt, platform);
+    return compositeImages(bgBuffer, productBuffer, platform, creative);
+  }
+}
+
 async function compositeImages(
   bgBuffer: Buffer,
   productBuffer: Buffer,
@@ -390,34 +422,48 @@ async function compositeImages(
   const { default: sharp } = await import('sharp');
 
   const bgMeta = await sharp(bgBuffer).metadata();
+  const bgWidth = bgMeta.width ?? 1024;
+  const bgHeight = bgMeta.height ?? 1024;
   const scaleMap: Record<string, number> = { tiktok: 0.62, facebook: 0.50, instagram: 0.58, youtube: 0.48, zalo: 0.48 };
   const scale = scaleMap[platform] ?? 0.60;
-  const prodWidth = Math.floor((bgMeta.width ?? 1024) * scale);
+  const prodWidth = Math.floor(bgWidth * scale);
+  const prodHeight = Math.floor(bgHeight * 0.82);
 
-  const resized = await sharp(productBuffer).resize(prodWidth, null, { fit: 'inside' }).png().toBuffer();
+  const resized = await sharp(productBuffer)
+    .resize(prodWidth, prodHeight, { fit: 'inside', withoutEnlargement: true })
+    .png()
+    .toBuffer();
   const prodMeta = await sharp(resized).metadata();
+  const finalProdWidth = Math.min(prodMeta.width ?? prodWidth, bgWidth);
+  const finalProdHeight = Math.min(prodMeta.height ?? prodHeight, bgHeight);
 
   const placement = creative?.productPlacement
     ?? ({ tiktok: 'bottom', facebook: 'right', instagram: 'center', youtube: 'right', zalo: 'right' }[platform] as CreativeDirection['productPlacement'])
     ?? 'center';
 
-  let left = Math.floor(((bgMeta.width ?? 1024) - (prodMeta.width ?? prodWidth)) / 2);
-  let top  = Math.floor(((bgMeta.height ?? 1024) - (prodMeta.height ?? prodWidth)) / 2);
+  let left = Math.floor((bgWidth - finalProdWidth) / 2);
+  let top  = Math.floor((bgHeight - finalProdHeight) / 2);
 
   if (placement === 'right') {
-    left = Math.max(20, (bgMeta.width ?? 1024) - (prodMeta.width ?? prodWidth) - Math.round((bgMeta.width ?? 1024) * 0.06));
-    top  = Math.floor(((bgMeta.height ?? 1024) - (prodMeta.height ?? prodWidth)) / 2);
+    left = bgWidth - finalProdWidth - Math.round(bgWidth * 0.06);
+    top  = Math.floor((bgHeight - finalProdHeight) / 2);
   } else if (placement === 'left') {
-    left = Math.round((bgMeta.width ?? 1024) * 0.06);
-    top  = Math.floor(((bgMeta.height ?? 1024) - (prodMeta.height ?? prodWidth)) / 2);
+    left = Math.round(bgWidth * 0.06);
+    top  = Math.floor((bgHeight - finalProdHeight) / 2);
   } else if (placement === 'bottom') {
-    left = Math.floor(((bgMeta.width ?? 1024) - (prodMeta.width ?? prodWidth)) / 2);
-    top = Math.max(20, (bgMeta.height ?? 1024) - (prodMeta.height ?? prodWidth) - Math.round((bgMeta.height ?? 1024) * 0.07));
+    left = Math.floor((bgWidth - finalProdWidth) / 2);
+    top = bgHeight - finalProdHeight - Math.round(bgHeight * 0.07);
   }
 
-  const shadow = await createProductShadow(prodMeta.width ?? prodWidth, prodMeta.height ?? prodWidth);
+  left = clamp(left, 0, Math.max(0, bgWidth - finalProdWidth));
+  top = clamp(top, 0, Math.max(0, bgHeight - finalProdHeight));
+
+  const shadow = await createProductShadow(finalProdWidth, finalProdHeight);
+  const shadowLeft = clamp(left + 16, 0, Math.max(0, bgWidth - finalProdWidth));
+  const shadowTop = clamp(top + 22, 0, Math.max(0, bgHeight - finalProdHeight));
+
   return sharp(bgBuffer).composite([
-    { input: shadow, left: left + 16, top: top + 22, blend: 'multiply' },
+    { input: shadow, left: shadowLeft, top: shadowTop, blend: 'multiply' },
     { input: resized, left, top },
   ]).jpeg({ quality: 95 }).toBuffer();
 }
@@ -507,12 +553,12 @@ function buildCreativeDirection(niche: string, platform: string, product: Visual
   };
 
   const themes: Record<string, string[]> = {
-    beauty: ['glossy vanity launch', 'clinical skincare lab', 'soft luxury editorial'],
-    tech: ['neon desk setup', 'futuristic product drop', 'minimal cyber showroom'],
-    food: ['fresh market burst', 'editorial kitchen counter', 'craveable close-up scene'],
-    fashion: ['magazine retail campaign', 'street-style product drop', 'boutique window display'],
-    home: ['warm interior refresh', 'clean lifestyle corner', 'modern decor reveal'],
-    health: ['wellness morning routine', 'fresh active lifestyle', 'clean supplement studio'],
+    beauty: ['premium skincare shelfie', 'clinical beauty studio', 'soft luxury vanity scene'],
+    tech: ['premium desk setup', 'clean tech showroom', 'modern device launch scene'],
+    food: ['fresh editorial kitchen', 'bright appetizing product scene', 'clean market-inspired setup'],
+    fashion: ['magazine retail campaign', 'boutique product display', 'minimal editorial styling'],
+    home: ['warm interior refresh', 'clean lifestyle corner', 'modern home decor scene'],
+    health: ['wellness morning routine', 'fresh supplement studio', 'clean active lifestyle scene'],
   };
 
   const placementByPlatform: Record<string, CreativeDirection['productPlacement']> = {
@@ -531,21 +577,56 @@ function buildCreativeDirection(niche: string, platform: string, product: Visual
   };
 
   const name = shortProductName(product.name);
-  const discountHeadline = product.discount ? `GIAM ${product.discount}%` : 'DEAL HOT';
+  const discountHeadline = product.discount ? `GIAM ${product.discount}%` : 'DANG CHU Y';
   const socialProof = product.rating
     ? `${product.rating.toFixed(1)} sao - ${(product.sold ?? 0).toLocaleString('vi-VN')}+ da ban`
-    : 'Dang duoc quan tam';
+    : 'Duoc nhieu nguoi quan tam';
+  const benefit = benefitByNiche(niche);
 
   return {
     theme: pickStable(themes[niche] ?? themes.beauty, `${product.name}:${platform}`),
     palette: palettes[niche] ?? palettes.beauty,
-    headline: platform === 'youtube' ? discountHeadline : name,
-    subline: platform === 'instagram' ? socialProof : `${discountHeadline} - ${socialProof}`,
-    cta: platform === 'youtube' ? 'Xem ngay' : 'Mua ngay',
+    headline: platform === 'youtube' ? discountHeadline : conciseHeadline(name, niche, platform),
+    subline: platform === 'instagram' ? `${benefit} - ${socialProof}` : `${discountHeadline} - ${benefit}`,
+    cta: platform === 'youtube' ? 'Xem ngay' : 'Xem deal',
     badge: discountHeadline,
     productPlacement: placementByPlatform[platform] ?? 'center',
     textZone: textZoneByPlatform[platform] ?? 'left',
   };
+}
+
+function buildPipelineBMarketingContext(
+  product: { name?: string; price?: number; rating?: number; sold?: number; discount?: number },
+  niche: string,
+  platform: string
+): string {
+  const parts = [
+    product.name ? `product ${shortProductName(product.name)}` : `${niche} product`,
+    `${niche} affiliate campaign`,
+    `${platform} placement`,
+    product.discount ? `${product.discount}% discount` : '',
+    product.rating ? `${product.rating.toFixed(1)} star rating` : '',
+    product.sold ? `${product.sold.toLocaleString('vi-VN')} sold` : '',
+  ];
+  return parts.filter(Boolean).join(', ');
+}
+
+function conciseHeadline(name: string, niche: string, platform: string): string {
+  if (platform === 'tiktok') return 'DANG THU THAT';
+  if (platform === 'facebook') return 'DEAL DANG XEM';
+  if (platform === 'zalo') return 'UU DAI HOM NAY';
+  return name || benefitByNiche(niche);
+}
+
+function benefitByNiche(niche: string): string {
+  return ({
+    beauty: 'Nang tam routine',
+    tech: 'Gon hon, tien hon',
+    food: 'Ngon va tien loi',
+    fashion: 'De phoi moi ngay',
+    home: 'Nha gon dep hon',
+    health: 'Cham soc moi ngay',
+  } as Record<string, string>)[niche] ?? 'Dang de thu';
 }
 
 async function createProductShadow(width: number, height: number): Promise<Buffer> {
@@ -706,7 +787,7 @@ async function transcribeVideo(videoPath: string): Promise<{
 
   const transcript = await openai.audio.transcriptions.create({
     file: fs.createReadStream(videoPath) as any,
-    model: 'whisper-1',
+    model: process.env.OPENAI_TRANSCRIPTION_MODEL || 'gpt-4o-transcribe',
     language: 'vi',
     response_format: 'verbose_json',
     timestamp_granularities: ['word', 'segment'],
@@ -727,16 +808,35 @@ async function findHighlight(transcript: {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
   const res = await openai.chat.completions.create({
-    model: 'gpt-4o',
-    messages: [{
-      role: 'user',
-      content: `Transcript video affiliate này, tìm đoạn 45 giây HAY NHẤT để cắt làm TikTok.
-Tiêu chí: hook mạnh, có giá trị, kết thúc tốt.
-Segments: ${JSON.stringify(transcript.segments.slice(0, 30))}
-Trả về JSON: {"start": 5.2, "end": 50.1, "hook_text": "...", "hook_frame_time": 5.2}`,
-    }],
+    model: process.env.OPENAI_VIDEO_AGENT_MODEL || 'gpt-5.5',
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'Bạn là editor video affiliate ngắn cho TikTok/Reels.',
+          'Chọn một đoạn liên tục có thể đứng độc lập, giữ người xem và có giá trị bán hàng tự nhiên.',
+          'Trả JSON hợp lệ duy nhất, không markdown, không giải thích.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `Hãy tìm đoạn tối đa ${clipDuration} giây hay nhất để cắt thành video dọc.`,
+          'Tiêu chí:',
+          '- 1-3 giây đầu có hook rõ, tránh lời chào hoặc mở đầu lan man.',
+          '- Có review/demo/vấn đề-giải pháp/bằng chứng/lý do mua.',
+          '- Không chọn đoạn chỉ nói giá hoặc CTA cứng nếu thiếu ngữ cảnh.',
+          '- Kết thúc ở một ý trọn vẹn hoặc CTA nhẹ.',
+          '- hook_text là tiếng Việt tự nhiên, tối đa 80 ký tự.',
+          '- hook_frame_time nằm trong đoạn được chọn và là khoảnh khắc đẹp để làm title/thumbnail.',
+          `Segments: ${JSON.stringify(transcript.segments.slice(0, 40))}`,
+          'Trả về đúng JSON shape:',
+          '{"start": 5.2, "end": 50.1, "hook_text": "Đoạn đáng xem nhất", "hook_frame_time": 6.0}',
+        ].join('\n'),
+      },
+    ],
     response_format: { type: 'json_object' },
-    max_tokens: 200,
+    max_tokens: 260,
   });
 
   try {
@@ -786,26 +886,38 @@ async function findHighlightForClip(transcript: {
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const res = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [{
-        role: 'user',
-        content: `Ban dang edit video affiliate. Hay chon 1 highlight tot nhat de cat thanh clip doc TikTok dai toi da ${clipDuration} giay.
-Muc tieu:
-- hook som, khong lan man
-- co gia tri review/demo/ban hang
-- ket thuc gon, giu duoc y chinh
-- uu tien doan khong bat dau qua sat 0s neu mo dau yeu
-
-Thong tin:
-- Tong thoi luong video: ${round2(videoDuration)} giay
-- Transcript segments:
-${segmentSummary}
-
-Tra ve JSON hop le:
-{"start": 12.5, "end": 52.5, "hook_text": "Cau mo dau ngan gon de lam title", "hook_frame_time": 14.0}`,
-      }],
+      model: process.env.OPENAI_VIDEO_AGENT_MODEL || 'gpt-5.5',
+      messages: [
+        {
+          role: 'system',
+          content: [
+            'You are a Vietnamese short-form affiliate video editor.',
+            'Pick one contiguous highlight that can become a complete vertical clip.',
+            'Return valid JSON only, with no markdown or explanation.',
+          ].join(' '),
+        },
+        {
+          role: 'user',
+          content: [
+            `Choose the strongest TikTok/Reels highlight, maximum ${clipDuration} seconds.`,
+            `Source duration: ${round2(videoDuration)} seconds.`,
+            'Selection rules:',
+            '- Skip weak greetings, filler, and long setup when possible.',
+            '- The first 1-3 seconds must make sense and create curiosity.',
+            '- Prefer product review, demo, problem-solution, result, comparison, objection handling, or soft recommendation.',
+            '- Avoid choosing a segment that is only price/discount unless it includes a reason to buy.',
+            '- End on a complete thought, payoff, or natural CTA.',
+            '- hook_text must be Vietnamese, natural, punchy, and max 80 characters.',
+            '- hook_frame_time must be inside the selected window and point to the best title/thumbnail moment.',
+            'Transcript segments:',
+            segmentSummary,
+            'Return exactly this JSON shape:',
+            '{"start": 12.5, "end": 52.5, "hook_text": "Cau mo dau ngan gon", "hook_frame_time": 14.0}',
+          ].join('\n'),
+        },
+      ],
       response_format: { type: 'json_object' },
-      max_tokens: 220,
+      max_tokens: 280,
     });
 
     const parsed = JSON.parse(res.choices[0].message.content ?? '{}');
@@ -1016,9 +1128,62 @@ async function rankAndPickBestImage(images: string[]): Promise<string> {
   if (images.length === 0) throw new Error('Không có ảnh để xử lý');
   if (images.length === 1) return images[0];
 
-  // Dùng GPT-4o Vision để rank nếu có nhiều ảnh
-  // Simple fallback: chọn ảnh đầu tiên
-  return images[0];
+  if (!process.env.OPENAI_API_KEY) return images[0];
+
+  const candidates = images.slice(0, 8);
+  try {
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const response = await withTimeout(
+      () => openai.chat.completions.create({
+        model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_VIDEO_AGENT_MODEL || 'gpt-5.5',
+        response_format: { type: 'json_object' },
+        max_tokens: 180,
+        messages: [
+          {
+            role: 'system',
+            content: [
+              'You are selecting the best source image for an affiliate product ad.',
+              'Pick the image that will work best for background removal and premium product photography.',
+              'Prefer a single clear product, front-facing packaging, readable label, high resolution, clean edges, minimal clutter, and no people.',
+              'Avoid collages, lifestyle scenes with hands/faces, screenshots, text-heavy promo banners, duplicate products, blurry images, and cropped packaging.',
+              'Return strict JSON only.',
+            ].join(' '),
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: [
+                  'Choose exactly one best candidate.',
+                  'Return JSON shape: {"index": 0, "reason": "single clear product with readable label"}',
+                  'Candidate images:',
+                ].join('\n'),
+              },
+              ...candidates.flatMap((url, index) => [
+                { type: 'text', text: `Candidate ${index}` },
+                { type: 'image_url', image_url: { url, detail: 'low' } },
+              ]),
+            ] as any,
+          },
+        ],
+      } as any),
+      25_000,
+      'Vision image ranking timed out after 25000ms'
+    );
+
+    const content = response.choices[0]?.message?.content ?? '{}';
+    const parsed = JSON.parse(content) as { index?: unknown };
+    const selectedIndex = Number(parsed.index);
+    if (Number.isInteger(selectedIndex) && selectedIndex >= 0 && selectedIndex < candidates.length) {
+      return candidates[selectedIndex];
+    }
+  } catch (error) {
+    console.warn(`[Visual] Vision image ranking fallback: ${(error as Error).message}`);
+  }
+
+  return candidates[0];
 }
 
 async function generateCarousel(userId: string, product: VisualProductData, niche: string, productCutout: Buffer): Promise<string[]> {
@@ -1044,9 +1209,8 @@ async function generateCarousel(userId: string, product: VisualProductData, nich
         productPlacement: index % 2 === 0 ? 'bottom' : 'right',
         textZone: index % 2 === 0 ? 'top' : 'left',
       };
-      const bg = await generateBackground(buildBgPrompt(niche, 'instagram', product, creative), 'instagram');
-      const composed = await compositeImages(bg, productCutout, 'instagram', creative);
-      const withText = await addCreativeTextOverlay(composed, 'instagram', product, creative);
+      const scene = await generatePhotorealisticProductScene(productCutout, niche, 'instagram', product, creative);
+      const withText = await addCreativeTextOverlay(scene, 'instagram', product, creative);
       const url = await uploadToStorage(withText, `${userId}/carousel_${index + 1}_${Date.now()}.jpg`);
       urls.push(url);
     } catch (error) {
@@ -1350,17 +1514,18 @@ function buildBgPrompt(
 
   if (creative) {
     return [
-      `Create a bold, scroll-stopping ${platform} advertising background for an affiliate product campaign.`,
+      `Create a premium ${platform} advertising background for an affiliate product campaign.`,
       `Product context: ${product?.name ? shortProductName(product?.name ?? '') : niche} in the ${niche} niche.`,
       `Creative theme: ${creative.theme}.`,
-      `Color direction: ${creative.palette.primary}, ${creative.palette.secondary}, ${creative.palette.accent}.`,
-      `${spaceHint}. Keep this zone clean for text overlays.`,
-      'Use layered depth, tasteful props, premium lighting, dynamic diagonal composition, realistic shadows, and strong visual contrast.',
-      'Background only. Do not include product packaging, people, hands, faces, readable text, logos, watermarks, or fake UI.',
+      `Color direction: ${creative.palette.primary}, ${creative.palette.secondary}, ${creative.palette.accent}. Use these colors as accents only, with a tasteful neutral base.`,
+      `${spaceHint}. Keep this zone calm, low-detail, and high-contrast enough for later text overlays.`,
+      'Use a cohesive commercial art direction: balanced negative space, realistic depth, premium lighting, tasteful niche-relevant props, natural shadows, and a clear surface where the product can sit.',
+      'The scene must feel like one real ad photo after the product is composited: consistent perspective, realistic contact area, no busy clutter, no competing hero object.',
+      'Background only. Do not include product packaging, people, hands, faces, readable text, logos, watermarks, fake UI, collages, or duplicate products.',
     ].join(' ');
   }
 
-  return `${bg}, ${spaceHint}, premium commercial product photography background, layered depth, tasteful props, dynamic lighting, no people, no hands, no face, no body, no text, no logo, no watermark`;
+  return `${bg}, ${spaceHint}, premium commercial product photography background, cohesive color palette, balanced negative space, realistic surface for product placement, tasteful niche-relevant props, soft realistic shadows, no people, no hands, no face, no body, no text, no logo, no watermark, no duplicate product`;
 }
 
 async function generateFallbackBackground(platform: string): Promise<Buffer> {

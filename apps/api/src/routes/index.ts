@@ -31,6 +31,19 @@ function extensionFromMime(mimeType: string): string {
   return '';
 }
 
+function visualUrlSourceType(productUrl: string): 'shopee_url' | 'lazada_url' | null {
+  try {
+    const host = new URL(productUrl).hostname.toLowerCase();
+    if (host.includes('shopee.vn') || host.includes('shp.ee')) return 'shopee_url';
+    if (host.includes('lazada.vn') || host.includes('lzd.co')) return 'lazada_url';
+  } catch {
+    const lower = productUrl.toLowerCase();
+    if (lower.includes('shopee.vn') || lower.includes('shp.ee')) return 'shopee_url';
+    if (lower.includes('lazada.vn') || lower.includes('lzd.co')) return 'lazada_url';
+  }
+  return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HEALTH
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -301,7 +314,15 @@ export async function visualRoutes(app: FastifyInstance) {
       platforms:   z.array(z.string()).default(['tiktok', 'facebook']),
       pipeline:    z.enum(['A', 'B', 'C', 'A+C']).default('B'),
     });
-    const { product_url, platforms, pipeline } = schema.parse(req.body);
+    const { product_url, platforms } = schema.parse(req.body);
+    const pipeline = 'B';
+    const sourceType = visualUrlSourceType(product_url);
+    if (!sourceType) {
+      return reply.status(400).send({
+        success: false,
+        error: { code: 'unsupported_product_url', message: 'Chỉ hỗ trợ link sản phẩm Shopee hoặc Lazada cho luồng URL' },
+      });
+    }
 
     // Check plan
     const { data: user } = await db.from('users').select('plan').eq('id', userId).single();
@@ -313,7 +334,7 @@ export async function visualRoutes(app: FastifyInstance) {
     const { data: job } = await db.from('visual_jobs').insert({
       user_id:    userId,
       pipeline,
-      source_type: product_url.includes('shopee') ? 'shopee_url' : 'lazada_url',
+      source_type: sourceType,
       source_url:  product_url,
       product_info: { affiliate_link: product_url },
     }).select().single();

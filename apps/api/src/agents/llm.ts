@@ -43,8 +43,7 @@ export interface LLMResult {
 
 // ── Cost estimation (USD per 1M tokens, April 2026) ───────────────
 const COST_PER_M: Record<string, { input: number; output: number }> = {
-  'gpt-4o-mini':       { input: 0.15,  output: 0.60  },
-  'gpt-4o':            { input: 2.50,  output: 10.00 },
+  'gpt-5.5':           { input: 5.00,  output: 30.00 },
   'claude-sonnet-4-5': { input: 3.00,  output: 15.00 },
   'claude-haiku-4-5':  { input: 0.25,  output: 1.25  },
 };

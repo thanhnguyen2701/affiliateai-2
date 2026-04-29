@@ -26,8 +26,7 @@ interface ProductPreview {
 // Detect platform from URL
 function detectPlatform(url: string): string {
   if (url.includes('shopee')) return 'Shopee';
-  if (url.includes('lazada')) return 'Lazada';
-  if (url.includes('tiktok')) return 'TikTok Shop';
+  if (url.includes('lazada') || url.includes('lzd.co')) return 'Lazada';
   return 'Unknown';
 }
 
@@ -35,7 +34,7 @@ function detectPlatform(url: string): string {
 function isValidUrl(url: string): boolean {
   try {
     const u = new URL(url);
-    return ['shopee.vn','shp.ee','lazada.vn','tiktok.com','lzd.co'].some(d => u.hostname.includes(d));
+    return ['shopee.vn','shp.ee','lazada.vn','lzd.co'].some(d => u.hostname.includes(d));
   } catch { return false; }
 }
 
@@ -71,7 +70,7 @@ export default function PipelineB({ platforms, brandKit, onJobCreated }: Props) 
   async function handleCreate() {
     const trimmed = url.trim();
     if (!isValidUrl(trimmed)) {
-      toast.error('URL không hợp lệ. Hỗ trợ: Shopee, Lazada, TikTok Shop');
+      toast.error('URL không hợp lệ. Hỗ trợ: Shopee hoặc Lazada');
       return;
     }
     if (platforms.length === 0) {
@@ -85,7 +84,7 @@ export default function PipelineB({ platforms, brandKit, onJobCreated }: Props) 
         id: result.job_id,
         pipeline: 'B',
         status: 'queued',
-        source_type: 'shopee_url',
+        source_type: detectPlatform(trimmed) === 'Lazada' ? 'lazada_url' : 'shopee_url',
         source_url: trimmed,
         product_info: { preview, style },
         assets: {},
@@ -121,7 +120,7 @@ export default function PipelineB({ platforms, brandKit, onJobCreated }: Props) 
               'input pr-24 font-mono text-[12px]',
               url && (valid ? 'border-emerald-DEFAULT/50' : 'border-rose-DEFAULT/50')
             )}
-            placeholder="https://shopee.vn/product/... hoặc https://shp.ee/..."
+            placeholder="https://shopee.vn/product/... hoặc https://lazada.vn/products/..."
             value={url}
             onChange={e => {
               setUrl(e.target.value);
@@ -147,7 +146,9 @@ export default function PipelineB({ platforms, brandKit, onJobCreated }: Props) 
           <span className="text-[10px] text-tx-4">Ví dụ:</span>
           {[
             { label: 'Shopee product', url: 'https://shopee.vn/product/123456/987654321' },
-            { label: 'Short link', url: 'https://shp.ee/xxxxx' },
+            { label: 'Shopee short', url: 'https://shp.ee/xxxxx' },
+            { label: 'Lazada product', url: 'https://www.lazada.vn/products/example-i123456789.html' },
+            { label: 'Lazada short', url: 'https://lzd.co/xxxxx' },
           ].map(ex => (
             <button key={ex.label}
               onClick={() => { setUrl(ex.url); setTimeout(() => loadPreview(ex.url), 100); }}

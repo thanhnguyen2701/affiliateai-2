@@ -41,14 +41,14 @@ const PIPELINES: { id: Pipeline; icon: string; label: string; desc: string; tag?
     id: 'B',
     icon: '🛒',
     label: 'URL Shopee / Lazada',
-    desc: 'Paste link sản phẩm — AI crawl ảnh, tạo bộ ảnh marketing tự động',
+    desc: 'Paste link sản phẩm — GPT-5.5 chọn ảnh, GPT Image 2 tạo bộ visual',
     tag: 'Phổ biến nhất',
   },
   {
     id: 'A',
     icon: '📸',
     label: 'Ảnh sản phẩm thực',
-    desc: 'Upload ảnh của bạn — AI xóa nền, tạo background lifestyle chuyên nghiệp',
+    desc: 'Upload ảnh của bạn — GPT Image tạo scene lifestyle hài hòa theo niche',
   },
   {
     id: 'C',
@@ -60,11 +60,11 @@ const PIPELINES: { id: Pipeline; icon: string; label: string; desc: string; tag?
 
 // ── Platform output options ───────────────────────────────────────────────────
 const OUTPUT_PLATFORMS = [
-  { id: 'tiktok',    label: 'TikTok', size: '1080×1920', icon: '🎬' },
-  { id: 'facebook',  label: 'Facebook', size: '1200×628', icon: '📘' },
-  { id: 'instagram', label: 'Instagram', size: '1080×1080', icon: '📷' },
-  { id: 'youtube',   label: 'YouTube', size: '1280×720', icon: '▶' },
-  { id: 'zalo',      label: 'Zalo', size: '700×400', icon: '💬' },
+  { id: 'tiktok',    label: 'TikTok', size: '1024×1536', icon: '🎬' },
+  { id: 'facebook',  label: 'Facebook', size: '1536×1024', icon: '📘' },
+  { id: 'instagram', label: 'Instagram', size: '1024×1024', icon: '📷' },
+  { id: 'youtube',   label: 'YouTube', size: '1536×1024', icon: '▶' },
+  { id: 'zalo',      label: 'Zalo', size: '1536×1024', icon: '💬' },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -410,9 +410,9 @@ const PIPELINE_STEPS: Record<Pipeline, Array<{ icon: string; text: string }>> = 
   B: [
     { icon: '🔗', text: 'Paste link Shopee/Lazada' },
     { icon: '🕷',  text: 'AI crawl ảnh sản phẩm' },
-    { icon: '🏆', text: 'Chọn ảnh đẹp nhất (GPT-4o Vision)' },
+    { icon: '🏆', text: 'Chọn ảnh đẹp nhất (GPT-5.5 Vision)' },
     { icon: '✂️', text: 'Remove background' },
-    { icon: '🎨', text: 'DALL-E tạo background lifestyle' },
+    { icon: '🎨', text: 'GPT Image 2 tạo scene lifestyle' },
     { icon: '✏️', text: 'Thêm giá, CTA, logo' },
     { icon: '📦', text: 'Export đa format' },
   ],
@@ -420,8 +420,8 @@ const PIPELINE_STEPS: Record<Pipeline, Array<{ icon: string; text: string }>> = 
     { icon: '📸', text: 'Upload ảnh sản phẩm' },
     { icon: '✂️', text: 'Remove.bg xóa nền chuyên nghiệp' },
     { icon: '⬆️', text: 'Upscale chất lượng (Real-ESRGAN)' },
-    { icon: '🎨', text: 'DALL-E tạo background theo niche' },
-    { icon: '🖼',  text: 'Ghép ảnh + text overlay' },
+    { icon: '🎨', text: 'GPT Image tạo scene lifestyle hài hòa' },
+    { icon: '🖼',  text: 'Giữ vùng trống sạch cho text overlay' },
     { icon: '📦', text: 'Export đa format' },
   ],
   C: [

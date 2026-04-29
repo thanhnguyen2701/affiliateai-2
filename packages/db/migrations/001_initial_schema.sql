@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
   source_name  VARCHAR(255),
   source_url   TEXT,
   chunk_text   TEXT        NOT NULL,
-  -- OpenAI text-embedding-3-small → 1536 dims
+  -- OpenAI text-embedding-3-large shortened to 1536 dims for pgvector schema compatibility
   embedding    VECTOR(1536),
   -- {page, date, product_id, language, ...}
   metadata     JSONB       NOT NULL DEFAULT '{}',
