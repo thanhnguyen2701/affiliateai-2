@@ -14,8 +14,8 @@ interface Props {
 }
 
 const SUBTITLE_STYLES = [
-  { v:'tiktok',    label:'TikTok Viral',   desc:'UPPERCASE, word highlight, font lớn' },
-  { v:'clean',     label:'Clean & Modern', desc:'Subtitle nhỏ gọn, chuyên nghiệp' },
+  { v:'tiktok',    label:'TikTok Viral',   desc:'Chữ lớn, nhấn từng cụm, hợp review nhanh' },
+  { v:'clean',     label:'Clean & Modern', desc:'Subtitle gọn, dễ đọc, chuyên nghiệp' },
   { v:'karaoke',   label:'Karaoke',        desc:'Highlight từng từ theo nhịp' },
 ];
 
@@ -54,7 +54,7 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
     }, []),
     onDropRejected: (rejected) => {
       const reason = rejected[0]?.errors[0]?.code === 'file-too-large'
-        ? 'File quá lớn (tối đa 500MB)'
+        ? 'File quá lớn (tối đa 100MB)'
         : 'Định dạng không hỗ trợ (dùng MP4/MOV)';
       toast.error(reason);
     },
@@ -91,7 +91,7 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
       onJobCreated(job);
       setFile(null);
       setPreview(null);
-      toast.success('🎬 Video đang được xử lý — ~5-7 phút');
+      toast.success('Video đang được xử lý - khoảng 3-6 phút');
     } catch (err) {
       toast.error('Upload thất bại: ' + (err as Error).message);
     } finally {
@@ -102,7 +102,7 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
   return (
     <div className="card p-4 space-y-4">
       <div className="text-xs font-bold text-tx-2 flex items-center gap-2">
-        🎬 Upload video raw
+        Upload video raw
         <span className="badge badge-teal text-[9px]">AI edit</span>
       </div>
 
@@ -138,14 +138,14 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
               </div>
               {videoDuration > 0 && videoDuration < clipDuration && (
                 <p className="text-[10px] text-amber-light mt-1">
-                  ⚠️ Video ngắn hơn clip duration ({clipDuration}s)
+                  Video ngắn hơn độ dài clip đã chọn ({clipDuration}s)
                 </p>
               )}
               <button
                 onClick={e => { e.stopPropagation(); setFile(null); setPreview(null); setVideoDuration(0); }}
                 className="btn btn-ghost btn-sm mt-2 text-[11px]"
               >
-                ✕ Chọn video khác
+                Chọn video khác
               </button>
             </div>
           </div>
@@ -155,9 +155,9 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
             <p className="text-sm font-medium text-tx-2 mb-1">
               {isDragActive ? 'Thả video vào đây...' : 'Kéo thả video hoặc click để chọn'}
             </p>
-            <p className="text-[11px] text-tx-4">MP4, MOV, AVI · Tối đa 500MB</p>
+            <p className="text-[11px] text-tx-4">MP4, MOV, AVI - Tối đa 100MB</p>
             <p className="text-[10px] text-tx-4 mt-1">
-              Tốt nhất: video review/unboxing 1-10 phút
+              Tốt nhất: video review/unboxing 1-10 phút, có lời thoại rõ.
             </p>
           </div>
         )}
@@ -210,15 +210,15 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
 
       {/* What AI will do */}
       <div className="bg-bg-3 rounded-xl p-3 border border-bdr-2">
-        <p className="text-[11px] font-semibold text-tx-2 mb-2">🤖 AI sẽ tự động:</p>
+        <p className="text-[11px] font-semibold text-tx-2 mb-2">AI sẽ tự động:</p>
         <div className="space-y-1">
           {[
-            'Transcribe toàn bộ lời thoại (Whisper AI)',
-            `Tìm đoạn ${clipDuration}s hay nhất làm highlight`,
-            'Enhance audio: xóa tiếng ồn, cân bằng âm lượng',
-            `Tạo subtitle kiểu "${SUBTITLE_STYLES.find(s => s.v === subStyle)?.label}"`,
-            'Extract thumbnail đẹp nhất từ video',
-            'Export 1080×1920 chuẩn TikTok/Reels',
+            'Transcribe toàn bộ lời thoại và tạo timestamp',
+            `Chọn đoạn ${clipDuration}s có hook mạnh nhất`,
+            'Dựng lại 9:16 với nền blur fill, không viền đen',
+            'Thêm opening title và subtitle dễ đọc',
+            'Lọc ồn, cân bằng âm lượng, encode chất lượng cao',
+            'Export 1080x1920 chuẩn TikTok/Reels',
           ].map((step, i) => (
             <div key={i} className="flex items-center gap-2">
               <div className="w-4 h-4 rounded bg-brand/15 flex items-center justify-center text-[9px] font-bold text-brand-lighter flex-shrink-0">
@@ -244,7 +244,7 @@ export default function PipelineC({ platforms, onJobCreated }: Props) {
             </svg>
             Đang upload...
           </>
-        ) : <>🎬 Xử lý video ({clipDuration}s clip)</>}
+        ) : <>Xử lý video ({clipDuration}s clip)</>}
       </button>
     </div>
   );

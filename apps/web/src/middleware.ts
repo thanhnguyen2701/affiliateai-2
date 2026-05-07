@@ -4,7 +4,11 @@
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
 
-const PUBLIC_PATHS = ['/auth/login', '/auth/register', '/auth/forgot-password', '/'];
+const PUBLIC_PATHS = ['/auth/login', '/auth/register', '/auth/forgot-password', '/auth/callback', '/'];
+
+function isPublicPath(path: string) {
+  return path === '/' || PUBLIC_PATHS.some(p => p !== '/' && path.startsWith(p));
+}
 
 export async function middleware(request: NextRequest) {
   let response = NextResponse.next({ request });
@@ -28,7 +32,7 @@ export async function middleware(request: NextRequest) {
   const path = request.nextUrl.pathname;
 
   // Chưa login → redirect về login (trừ public paths)
-  if (!user && !PUBLIC_PATHS.some(p => path.startsWith(p))) {
+  if (!user && !isPublicPath(path)) {
     return NextResponse.redirect(new URL('/auth/login', request.url));
   }
 

@@ -170,7 +170,7 @@ function toShopeeOffer(node: ShopeeProductOfferNode): ShopeeOffer {
   return {
     item_id: String(node.productId ?? ''),
     shop_id: String(node.shopId ?? ''),
-    item_name: node.productName?.trim() || 'San pham Shopee',
+    item_name: node.productName?.trim() || 'Sản phẩm Shopee',
     product_link: node.offerLink || node.originalLink || '',
     image: node.imageUrl || '',
     original_price: originalPrice,
@@ -453,7 +453,7 @@ export async function scrapeShopeeUrl(url: string): Promise<{
   const resolvedUrl = await resolveShopeeUrl(url);
   const ids = parseShopeeIds(resolvedUrl) ?? parseShopeeIds(url);
   if (!ids) {
-    throw new Error('Khong tach duoc shopId/itemId tu URL Shopee');
+    throw new Error('Không tách được shopId/itemId từ URL Shopee');
   }
 
   const info = await getShopeeProductInfo(ids.itemId, ids.shopId, {
@@ -462,7 +462,7 @@ export async function scrapeShopeeUrl(url: string): Promise<{
   });
 
   if (!info) {
-    throw new Error('Shopee Open API khong tra ve du lieu cho URL nay');
+    throw new Error('Shopee Open API không trả về dữ liệu cho URL này');
   }
 
   const discount = info.original_price > 0 && info.original_price > info.sale_price

@@ -11,7 +11,6 @@ import { orchestrate } from '../agents/index.js';
 import { memoryService } from '../services/memory/memory-service.js';
 import { getSupabase } from '../lib/supabase.js';
 import { visualQueue } from '../services/visual/visual-queue.js';
-import type { Platform, AffiliateNetwork } from '../../../packages/shared/src/types.js';
 
 function multipartFieldValues(input: unknown): string[] {
   if (Array.isArray(input)) return input.flatMap(multipartFieldValues);
@@ -29,6 +28,192 @@ function extensionFromMime(mimeType: string): string {
   if (mimeType.includes('mp4')) return '.mp4';
   if (mimeType.includes('quicktime')) return '.mov';
   return '';
+}
+
+const CONTENT_PLATFORMS = ['tiktok', 'facebook', 'instagram', 'blog', 'youtube', 'zalo', 'email'] as const;
+type ContentPlatform = typeof CONTENT_PLATFORMS[number];
+type HistoryPlatform = ContentPlatform | 'trends' | 'offers';
+
+function normalizeContentPlatform(value: unknown): ContentPlatform | null {
+  if (typeof value !== 'string') return null;
+  const lower = value.trim().toLowerCase();
+  const aliases: Record<string, ContentPlatform> = {
+    fb: 'facebook',
+    face: 'facebook',
+    ig: 'instagram',
+    insta: 'instagram',
+    reels: 'instagram',
+    reel: 'instagram',
+    shorts: 'youtube',
+    short: 'youtube',
+    yt: 'youtube',
+    article: 'blog',
+    post: 'blog',
+  };
+  const normalized = aliases[lower] ?? lower;
+  return (CONTENT_PLATFORMS as readonly string[]).includes(normalized)
+    ? normalized as ContentPlatform
+    : null;
+}
+
+function inferContentPlatform(message: string, content: string): ContentPlatform {
+  const source = `${message}\n${content.slice(0, 1200)}`.toLowerCase();
+  const patterns: Array<[ContentPlatform, RegExp]> = [
+    ['tiktok', /\b(tiktok|tik tok|kịch bản video|script|viral|fyp|link bio)\b/i],
+    ['facebook', /\b(facebook|fb|caption facebook|bài đăng facebook|comment|inbox)\b/i],
+    ['instagram', /\b(instagram|insta|ig|reels|story|bio|carousel)\b/i],
+    ['youtube', /\b(youtube|shorts|yt|video dài|thumbnail)\b/i],
+    ['zalo', /\b(zalo|oa|broadcast)\b/i],
+    ['email', /\b(email|newsletter|subject line|tiêu đề email)\b/i],
+    ['blog', /\b(blog|bài viết|article|seo|h2|h3|mục lục)\b/i],
+  ];
+  return patterns.find(([, pattern]) => pattern.test(source))?.[0] ?? 'tiktok';
+}
+
+function detectRequestedHistoryPlatforms(message: string): ContentPlatform[] {
+  const source = message
+    .toLowerCase()
+    .replace(/\btiktok\s*shop\b/g, 'marketplace')
+    .replace(/\bshop\s*tiktok\b/g, 'marketplace');
+  const patterns: Array<[ContentPlatform, RegExp]> = [
+    ['facebook', /\b(facebook|fb|caption facebook|bài đăng facebook|post facebook)\b/i],
+    ['tiktok', /\b(tiktok|tik tok|kịch bản tiktok|video tiktok|script tiktok)\b/i],
+    ['instagram', /\b(instagram|insta|ig|reels|story instagram|caption instagram)\b/i],
+    ['youtube', /\b(youtube|yt|shorts|youtube shorts)\b/i],
+    ['zalo', /\b(zalo|zalo oa|oa)\b/i],
+    ['email', /\b(email|newsletter|subject line)\b/i],
+    ['blog', /\b(blog|bài viết|article|seo article)\b/i],
+  ];
+  return [...new Set(patterns.filter(([, pattern]) => pattern.test(source)).map(([platform]) => platform))];
+}
+
+function contentRowsForHistory(params: {
+  userId: string;
+  message: string;
+  content: string;
+  structured?: Record<string, unknown>;
+  qualityScore?: number;
+}): Array<Record<string, unknown>> {
+  const structured = params.structured ?? {};
+  const platforms: ContentPlatform[] = [];
+  const hashtags: string[] = [];
+
+  for (const [key, value] of Object.entries(structured)) {
+    if (!value || typeof value !== 'object') continue;
+    const item = value as Record<string, unknown>;
+    const platform = normalizeContentPlatform(item.platform) ?? normalizeContentPlatform(key);
+    if (platform) platforms.push(platform);
+    if (Array.isArray(item.hashtags)) {
+      hashtags.push(...item.hashtags.map(tag => String(tag).trim()).filter(Boolean));
+    }
+  }
+
+  const requestedPlatforms = detectRequestedHistoryPlatforms(params.message);
+  const platform = requestedPlatforms[0] ?? platforms[0] ?? inferContentPlatform(params.message, params.content);
+  const uniqueHashtags = [...new Set(hashtags)].slice(0, 30);
+
+  return [{
+    user_id: params.userId,
+    content: params.content.slice(0, 10000),
+    platform,
+    content_type: platforms.length > 1 ? 'multi_platform_content' : platform,
+    hashtags: uniqueHashtags,
+    quality_score: params.qualityScore,
+  }];
+}
+
+function normalizeQualityScore(value: unknown): number | null {
+  const score = Number(value);
+  return Number.isFinite(score)
+    ? Math.max(0, Math.min(100, Math.round(score)))
+    : null;
+}
+
+function normalizeHistoryRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return rows
+    .map(row => {
+      const platform = typeof row.platform === 'string' && row.platform.trim()
+        ? row.platform.trim().slice(0, 50)
+        : '';
+      const content = typeof row.content === 'string' ? row.content.trim().slice(0, 10000) : '';
+      if (!platform || !content) return null;
+
+      return {
+        user_id: row.user_id,
+        product_name: typeof row.product_name === 'string' ? row.product_name.slice(0, 500) : null,
+        affiliate_network: typeof row.affiliate_network === 'string' ? row.affiliate_network.slice(0, 50) : null,
+        affiliate_link: typeof row.affiliate_link === 'string' ? row.affiliate_link : null,
+        platform,
+        content_type: typeof row.content_type === 'string' ? row.content_type.slice(0, 50) : platform,
+        content,
+        hashtags: Array.isArray(row.hashtags) ? row.hashtags.map(tag => String(tag).trim()).filter(Boolean) : [],
+        quality_score: normalizeQualityScore(row.quality_score),
+      };
+    })
+    .filter((row): row is Record<string, unknown> => Boolean(row));
+}
+
+async function saveContentHistoryRows(
+  db: ReturnType<typeof getSupabase>,
+  rows: Array<Record<string, unknown>>,
+  log: { error: (payload: unknown, message?: string) => void }
+): Promise<string | null> {
+  const normalizedRows = normalizeHistoryRows(rows);
+  if (normalizedRows.length === 0) return null;
+
+  const { data, error } = await db
+    .from('content_history')
+    .insert(normalizedRows)
+    .select('id')
+    .limit(1);
+
+  if (!error) return data?.[0]?.id ?? null;
+
+  log.error({ err: error, rows: normalizedRows.map(row => ({ platform: row.platform, content_type: row.content_type })) }, 'Failed to save content_history rows');
+
+  if (normalizedRows.length === 1) return null;
+
+  const fallback = {
+    ...normalizedRows[0],
+    content: normalizedRows.map(row => String(row.content)).join('\n\n---\n\n').slice(0, 10000),
+  };
+  const retry = await db
+    .from('content_history')
+    .insert(fallback)
+    .select('id')
+    .single();
+
+  if (retry.error) {
+    log.error({ err: retry.error, platform: fallback.platform }, 'Failed to save content_history fallback row');
+    return null;
+  }
+  return retry.data?.id ?? null;
+}
+
+function researchRowsForHistory(params: {
+  userId: string;
+  intent: string;
+  content: string;
+}): Array<Record<string, unknown>> {
+  if (params.intent === 'offer_find') {
+    return [{
+      user_id: params.userId,
+      content: params.content.slice(0, 10000),
+      platform: 'offers' satisfies HistoryPlatform,
+      content_type: 'top_offers',
+    }];
+  }
+
+  if (params.intent !== 'trend_research') return [];
+
+  return [{
+    user_id: params.userId,
+    content: params.content.slice(0, 10000),
+    platform: 'trends' satisfies HistoryPlatform,
+    content_type: params.content.toLowerCase().includes('top offers')
+      ? 'trend_research_with_offers'
+      : 'trend_research',
+  }];
 }
 
 function visualUrlSourceType(productUrl: string): 'shopee_url' | 'lazada_url' | null {
@@ -179,17 +364,47 @@ export async function agentRoutes(app: FastifyInstance) {
       intent: intent as any,
     });
 
+    if (!result.success) {
+      return reply.status(502).send({
+        success: false,
+        error: {
+          code: 'agent_failed',
+          message: result.error || result.content || 'AI không tạo được phản hồi',
+        },
+      });
+    }
+
+    if (!result.content?.trim()) {
+      return reply.status(502).send({
+        success: false,
+        error: {
+          code: 'agent_empty_response',
+          message: 'AI không trả về nội dung hiển thị',
+        },
+      });
+    }
+
     // Deduct 1 credit
     await db.from('users').update({ credits_used: user.credits_used + 1 }).eq('id', userId);
 
-    // Save to content history if content was created
-    if (result.success && result.content && result.intent === 'content_create') {
-      await db.from('content_history').insert({
-        user_id: userId,
-        content: result.content.slice(0, 10000),
-        platform: 'multi',
-        quality_score: result.quality_score,
-      });
+    let savedContentId: string | null = null;
+
+    // Save generated outputs to history so /dashboard/content can show drafts, trends, and offers.
+    if (result.success && result.content && ['content_create', 'trend_research', 'offer_find'].includes(result.intent)) {
+      const rows = result.intent === 'content_create'
+        ? contentRowsForHistory({
+            userId,
+            message,
+            content: result.content,
+            structured: result.structured_data,
+            qualityScore: result.quality_score,
+          })
+        : researchRowsForHistory({
+            userId,
+            intent: result.intent,
+            content: result.content,
+          });
+      savedContentId = await saveContentHistoryRows(db, rows, req.log);
     }
 
     return {
@@ -199,6 +414,7 @@ export async function agentRoutes(app: FastifyInstance) {
         content:       result.content,
         structured:    result.structured_data,
         quality_score: result.quality_score,
+        content_id:    savedContentId,
       },
       meta: {
         credits_used:      1,
@@ -254,6 +470,11 @@ export async function visualRoutes(app: FastifyInstance) {
     const pipeline = file.mimetype.startsWith('video/') ? 'C' : (requestedPipeline || 'A');
     const platforms = multipartFieldValues(file.fields?.platforms);
     const niche = String((file.fields?.niche as { value?: unknown } | undefined)?.value ?? '');
+    const productDescription = String((file.fields?.product_description as { value?: unknown } | undefined)?.value ?? '').slice(0, 1200);
+    const headline = String((file.fields?.headline as { value?: unknown } | undefined)?.value ?? '');
+    const subline = String((file.fields?.subline as { value?: unknown } | undefined)?.value ?? '');
+    const cta = String((file.fields?.cta as { value?: unknown } | undefined)?.value ?? '');
+    const badge = String((file.fields?.badge as { value?: unknown } | undefined)?.value ?? '');
     const subStyle = String((file.fields?.sub_style as { value?: unknown } | undefined)?.value ?? '');
     const clipDurationValue = String((file.fields?.clip_duration as { value?: unknown } | undefined)?.value ?? '');
     const clipDuration = Number(clipDurationValue);
@@ -279,6 +500,11 @@ export async function visualRoutes(app: FastifyInstance) {
       source_url: null,
       product_info: {
         ...(niche ? { niche } : {}),
+        ...(productDescription ? { product_description: productDescription } : {}),
+        ...(headline ? { headline } : {}),
+        ...(subline ? { subline } : {}),
+        ...(cta ? { cta } : {}),
+        ...(badge ? { badge } : {}),
         ...(subStyle ? { subStyle } : {}),
         ...(Number.isFinite(clipDuration) && clipDuration > 0 ? { clipDuration } : {}),
       },
@@ -296,6 +522,7 @@ export async function visualRoutes(app: FastifyInstance) {
       platforms: platforms.length > 0 ? platforms : ['tiktok', 'facebook', 'instagram'],
       pipeline,
       ...(niche ? { niche } : {}),
+      copy: { productDescription, headline, subline, cta, badge },
       ...(subStyle ? { subStyle } : {}),
       ...(Number.isFinite(clipDuration) && clipDuration > 0 ? { clipDuration } : {}),
     }).catch(console.error);

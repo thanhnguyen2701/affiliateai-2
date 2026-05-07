@@ -12,7 +12,12 @@ export interface ContentBundle {
 }
 
 export interface VisualAssets {
+  [key: string]: string | string[] | undefined;
   facebook_banner?:     string;
+  instagram_banner?:    string;
+  tiktok_banner?:       string;
+  youtube_banner?:      string;
+  zalo_banner?:         string;
   tiktok_thumbnail?:    string;
   tiktok_video?:        string;
   instagram_carousel?:  string | string[];

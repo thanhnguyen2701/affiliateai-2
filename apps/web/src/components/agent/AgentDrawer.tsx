@@ -2,11 +2,13 @@
 // apps/web/src/components/agent/AgentDrawer.tsx
 
 import { useRef, useEffect, useState, KeyboardEvent } from 'react';
+import { useRouter } from 'next/navigation';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
 import { useUIStore, useChatStore, useUserStore } from '@/lib/store';
 import { agentAPI } from '@/lib/api';
 import type { ContentBundle } from '@/types';
+import MarkdownMessage from './MarkdownMessage';
 
 const QUICK_ACTIONS = [
   { label: '🎬 Review TikTok',   msg: 'Viết script TikTok review kem dưỡng da Innisfree cho tôi', intent: 'content_create' },
@@ -17,6 +19,7 @@ const QUICK_ACTIONS = [
 ];
 
 export default function AgentDrawer() {
+  const router = useRouter();
   const { agentDrawerOpen, setAgentDrawer } = useUIStore();
   const { messages, isLoading, addMessage, updateMsg, setLoading } = useChatStore();
   const { deductCredit } = useUserStore();
@@ -54,18 +57,27 @@ export default function AgentDrawer() {
       deductCredit();
 
       // Replace typing with actual response
+      const assistantContent = result.content?.trim() || 'AI đã phản hồi nhưng không có nội dung hiển thị. Vui lòng thử lại.';
       updateMsg(typingId, {
-        content:       result.content,
+        content:       assistantContent,
         structured:    result.structured as Record<string, unknown>,
         quality_score: result.quality_score,
         isTyping:      false,
       });
+
+      if (result.intent === 'content_create') {
+        window.dispatchEvent(new CustomEvent('affiliateai:content-created', {
+          detail: { contentId: result.content_id ?? null },
+        }));
+        router.refresh();
+      }
     } catch (err) {
+      const message = (err as Error).message || 'Không rõ nguyên nhân';
       updateMsg(typingId, {
-        content:  '⚠️ Lỗi kết nối AI. Vui lòng thử lại.',
+        content:  `⚠️ Lỗi kết nối AI: ${message}`,
         isTyping: false,
       });
-      toast.error('Lỗi: ' + (err as Error).message);
+      toast.error('Lỗi: ' + message);
     } finally {
       setLoading(false);
     }
@@ -145,7 +157,7 @@ export default function AgentDrawer() {
                   </div>
                 ) : (
                   <>
-                    <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
+                    <MarkdownMessage content={msg.content} compact />
                     {/* Quality score */}
                     {msg.quality_score && (
                       <div className="mt-2 flex items-center gap-2">

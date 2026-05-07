@@ -42,9 +42,13 @@ export default function RegisterPage() {
     setLoading(true);
     try {
       const supabase = createClient();
+      const origin = window.location.origin;
       const { error } = await supabase.auth.signUp({
         email: form.email, password: form.password,
-        options: { data: { niche: form.niche, tone: form.tone } },
+        options: {
+          emailRedirectTo: `${origin}/auth/callback?next=/dashboard`,
+          data: { niche: form.niche, tone: form.tone },
+        },
       });
       if (error) throw error;
       setStep('done');
@@ -165,11 +169,11 @@ export default function RegisterPage() {
                 Kiểm tra email <span className="text-tx-1 font-medium">{form.email}</span> để xác nhận.
               </p>
               <p className="text-tx-4 text-[11px] mb-5">
-                (Có thể vào thẳng dashboard nếu không cần xác nhận email trong môi trường dev)
+                Nếu không thấy email, kiểm tra spam hoặc cấu hình Supabase Auth SMTP.
               </p>
-              <button onClick={() => router.push('/dashboard')}
+              <button onClick={() => router.push('/auth/login')}
                 className="btn btn-primary btn-lg w-full justify-center">
-                Vào Dashboard →
+                Đi đến đăng nhập →
               </button>
             </div>
           )}

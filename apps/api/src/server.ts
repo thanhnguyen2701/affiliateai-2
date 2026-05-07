@@ -181,7 +181,7 @@ async function start() {
     app.log.info('');
     app.log.info('╔══════════════════════════════════════════╗');
     app.log.info('║   🤖 AffiliateAI API — Running           ║');
-    app.log.info(`║   http://192.168.1.149:${port}                ║`);
+    app.log.info(`║   http://192.168.1.163:${port}                ║`);
     app.log.info('╚══════════════════════════════════════════╝');
     app.log.info('');
     app.log.info(`  ENV     : ${process.env.NODE_ENV ?? 'development'}`);

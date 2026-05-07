@@ -1,15 +1,16 @@
 'use client';
 // apps/web/src/app/dashboard/content/page.tsx
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import clsx from 'clsx';
 import toast from 'react-hot-toast';
+import { Share2 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import { useUIStore } from '@/lib/store';
 import { formatDistanceToNow } from 'date-fns';
 import { vi } from 'date-fns/locale';
 
-type Platform = 'all' | 'tiktok' | 'facebook' | 'instagram' | 'blog' | 'youtube' | 'zalo' | 'email';
+type Platform = 'all' | 'tiktok' | 'facebook' | 'instagram' | 'blog' | 'youtube' | 'zalo' | 'email' | 'trends' | 'offers';
 type SortBy   = 'newest' | 'score' | 'rating';
 
 interface ContentItem {
@@ -33,6 +34,8 @@ const PLATFORM_CONFIG: Record<string, { icon: string; color: string; bg: string 
   youtube:   { icon: '▶',  color: '#EF4444', bg: 'rgba(239,68,68,.1)'  },
   zalo:      { icon: '💬', color: '#0066FF', bg: 'rgba(0,102,255,.1)'  },
   email:     { icon: '📧', color: '#F59E0B', bg: 'rgba(245,158,11,.1)' },
+  trends:    { icon: 'TR', color: '#22C55E', bg: 'rgba(34,197,94,.1)' },
+  offers:    { icon: 'OF', color: '#F97316', bg: 'rgba(249,115,22,.1)' },
   multi:     { icon: '📦', color: '#9CA3AF', bg: 'rgba(156,163,175,.1)' },
 };
 
@@ -44,7 +47,38 @@ const PLATFORMS: { id: Platform; label: string }[] = [
   { id: 'blog',      label: '📝 Blog' },
   { id: 'youtube',   label: '▶ YouTube' },
   { id: 'zalo',      label: '💬 Zalo' },
+  { id: 'trends',    label: 'TR Trends' },
+  { id: 'offers',    label: 'OF Top offers' },
 ];
+
+function inferDisplayPlatform(content: string): Exclude<Platform, 'all'> {
+  const source = content.toLowerCase();
+  if (/^top\s+\d+\s+trends\b|^top\s+trends\b|trend hôm nay|xu hướng/i.test(source)) return 'trends';
+  if (/^top\s+\d+\s+offers\b|^top\s+offers\b|hh:|epc:|commission|hoa hồng/i.test(source)) return 'offers';
+
+  const heading = source.match(/^##\s*(tiktok|facebook|instagram|blog|youtube|zalo|email|trends|offers)\b/m)?.[1];
+  if (heading) return heading as Exclude<Platform, 'all'>;
+
+  const patterns: Array<[Exclude<Platform, 'all'>, RegExp]> = [
+    ['tiktok', /\b(tiktok|tik tok|script|viral|fyp|link bio|pov)\b/i],
+    ['facebook', /\b(facebook|fb|caption facebook|comment|inbox)\b/i],
+    ['instagram', /\b(instagram|insta|ig|reels|story|bio|carousel)\b/i],
+    ['youtube', /\b(youtube|shorts|thumbnail)\b/i],
+    ['zalo', /\b(zalo|oa|broadcast)\b/i],
+    ['email', /\b(email|newsletter|subject line)\b/i],
+    ['blog', /\b(blog|seo|h2|h3|mục lục|bài viết)\b/i],
+    ['trends', /\b(trend|trending|xu hướng)\b/i],
+    ['offers', /\b(offer|offers|epc|hoa hồng|commission)\b/i],
+  ];
+  return patterns.find(([, pattern]) => pattern.test(source))?.[0] ?? 'tiktok';
+}
+
+function displayPlatform(item: ContentItem): Exclude<Platform, 'all'> {
+  if (['trends', 'offers'].includes(item.platform)) return item.platform as Exclude<Platform, 'all'>;
+  return item.platform === 'multi'
+    ? inferDisplayPlatform(item.content)
+    : (item.platform as Exclude<Platform, 'all'>);
+}
 
 // Demo content for empty state
 const DEMO_CONTENT: ContentItem[] = [
@@ -66,28 +100,35 @@ export default function ContentPage() {
   const [expanded,    setExpanded]    = useState<string | null>(null);
   const [rating,      setRating]      = useState<Record<string, number>>({});
 
-  useEffect(() => {
-    async function load() {
-      try {
-        const supabase = createClient();
-        const { data: { user } } = await supabase.auth.getUser();
-        if (!user) return;
-        const { data } = await supabase
-          .from('content_history')
-          .select('*')
-          .eq('user_id', user.id)
-          .order('created_at', { ascending: false })
-          .limit(50);
-        setItems(data && data.length > 0 ? data : DEMO_CONTENT);
-      } catch { setItems(DEMO_CONTENT); }
-      finally  { setLoading(false); }
-    }
-    load();
+  const loadContent = useCallback(async () => {
+    try {
+      const supabase = createClient();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+      const { data } = await supabase
+        .from('content_history')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(50);
+      setItems(data && data.length > 0 ? data : DEMO_CONTENT);
+    } catch { setItems(DEMO_CONTENT); }
+    finally  { setLoading(false); }
   }, []);
+
+  useEffect(() => {
+    loadContent();
+  }, [loadContent]);
+
+  useEffect(() => {
+    const refresh = () => loadContent();
+    window.addEventListener('affiliateai:content-created', refresh);
+    return () => window.removeEventListener('affiliateai:content-created', refresh);
+  }, [loadContent]);
 
   // Filter + sort
   const filtered = items
-    .filter(i => platform === 'all' || i.platform === platform)
+    .filter(i => platform === 'all' || displayPlatform(i) === platform)
     .filter(i => !search || i.content.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => {
       if (sortBy === 'score')  return (b.quality_score ?? 0) - (a.quality_score ?? 0);
@@ -100,9 +141,56 @@ export default function ContentPage() {
   const scoreBg = (s: number | null) =>
     !s ? '' : s >= 85 ? 'bg-emerald-DEFAULT/10' : s >= 70 ? 'bg-amber/10' : 'bg-rose-DEFAULT/10';
 
+  function copyTextToClipboard(text: string): boolean {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, text.length);
+
+    try {
+      return document.execCommand('copy');
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  }
+
   async function copyContent(item: ContentItem) {
-    await navigator.clipboard.writeText(item.content);
+    const copied = copyTextToClipboard(item.content);
+    if (!copied) {
+      toast.error('Khong the copy content.');
+      return;
+    }
     toast.success('📋 Đã copy content!');
+  }
+
+  async function shareToFacebook(item: ContentItem) {
+    const targetUrl = item.affiliate_link || window.location.href;
+    const params = new URLSearchParams({ u: targetUrl });
+    const copied = copyTextToClipboard(item.content);
+
+    const popup = window.open(
+      `https://www.facebook.com/sharer/sharer.php?${params.toString()}`,
+      '_blank',
+      'width=720,height=640'
+    );
+
+    if (!popup) {
+      toast.error('Không thể mở Facebook. Hãy kiểm tra popup blocker.');
+      return;
+    }
+
+    popup.opener = null;
+    if (!copied) {
+      toast.error('Da mo Facebook nhung chua copy duoc content.');
+      return;
+    }
+    toast.success('Đã mở Facebook. Content đã được copy để dán vào bài đăng.');
   }
 
   async function rateContent(id: string, stars: number) {
@@ -116,7 +204,7 @@ export default function ContentPage() {
   }
 
   const counts = PLATFORMS.slice(1).reduce((acc, p) => {
-    acc[p.id] = items.filter(i => i.platform === p.id).length;
+    acc[p.id] = items.filter(i => displayPlatform(i) === p.id).length;
     return acc;
   }, {} as Record<string, number>);
 
@@ -196,7 +284,8 @@ export default function ContentPage() {
       ) : (
         <div className="space-y-2">
           {filtered.map(item => {
-            const cfg  = PLATFORM_CONFIG[item.platform] ?? PLATFORM_CONFIG.multi;
+            const itemPlatform = displayPlatform(item);
+            const cfg  = PLATFORM_CONFIG[itemPlatform] ?? PLATFORM_CONFIG.multi;
             const open = expanded === item.id;
             const ago  = formatDistanceToNow(new Date(item.created_at), { addSuffix: true, locale: vi });
             const stars = rating[item.id] ?? item.user_rating ?? 0;
@@ -220,7 +309,7 @@ export default function ContentPage() {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
                       <span className="text-[10px] font-bold uppercase tracking-wide"
-                        style={{ color: cfg.color }}>{item.platform}</span>
+                        style={{ color: cfg.color }}>{itemPlatform}</span>
                       {item.quality_score && (
                         <span className={clsx('badge text-[9px]', scoreBg(item.quality_score))}>
                           <span className={scoreColor(item.quality_score)}>{item.quality_score}/100</span>
@@ -246,6 +335,10 @@ export default function ContentPage() {
 
                   {/* Actions */}
                   <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <button onClick={e => { e.stopPropagation(); shareToFacebook(item); }}
+                      className="btn btn-ghost btn-icon btn-sm text-[#1877F2]" title="Share Facebook" aria-label="Share Facebook">
+                      <Share2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
                     <button onClick={e => { e.stopPropagation(); copyContent(item); }}
                       className="btn btn-ghost btn-icon btn-sm" title="Copy">📋</button>
                     <span className="text-tx-4 text-sm">{open ? '▲' : '▽'}</span>
@@ -296,6 +389,11 @@ export default function ContentPage() {
                         <button onClick={() => copyContent(item)}
                           className="btn btn-ghost btn-sm gap-1.5 text-[11px]">
                           📋 Copy content
+                        </button>
+                        <button onClick={() => shareToFacebook(item)}
+                          className="btn btn-ghost btn-sm gap-1.5 text-[11px] text-[#1877F2]">
+                          <Share2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          Share Facebook
                         </button>
                         <button onClick={() => {
                           setAgentDrawer(true);

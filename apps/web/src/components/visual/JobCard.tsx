@@ -18,9 +18,9 @@ const PIPELINE_EMOJI: Record<string, string> = {
 
 const STATUS_CONFIG = {
   done: { label: 'Xong', cls: 'badge-green' },
-  processing: { label: 'Dang xu ly', cls: 'badge-blue' },
-  queued: { label: 'Cho', cls: 'badge-amber' },
-  failed: { label: 'Loi', cls: 'badge-rose' },
+  processing: { label: 'Đang xử lý', cls: 'badge-blue' },
+  queued: { label: 'Chờ', cls: 'badge-amber' },
+  failed: { label: 'Lỗi', cls: 'badge-rose' },
 };
 
 const PREVIEW_PRIORITY = [
@@ -88,7 +88,7 @@ export default function JobCard({ job, onClick }: Props) {
                        flex items-center justify-center"
           >
             <span className="rounded-lg bg-black/50 px-2 py-1 text-xs font-semibold text-white">
-              Xem va tai
+              Xem và tải
             </span>
           </div>
         )}

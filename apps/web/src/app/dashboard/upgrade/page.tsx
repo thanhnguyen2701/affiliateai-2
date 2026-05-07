@@ -99,7 +99,7 @@ export default function UpgradePage() {
           creditsTotal: result.credits_total,
           creditsUsed: result.credits_used,
         });
-        toast.success(result.message || 'Da nang cap len Starter');
+        toast.success(result.message || 'Đã nâng cấp lên Starter');
         router.push('/dashboard');
         router.refresh();
         return;

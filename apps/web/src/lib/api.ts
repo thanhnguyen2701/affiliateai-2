@@ -2,21 +2,35 @@
 // Typed API client cho backend Fastify
 
 import { createClient } from './supabase/client';
-import type { AgentOutput, ContentBundle, VisualAssets } from '../types';
-
-const DEFAULT_DEV_API_HOST = '192.168.1.149';
+import type { ContentBundle, VisualAssets } from '../types';
 
 function resolveApiBase(): string {
   const configured = process.env.NEXT_PUBLIC_API_URL?.trim();
-  if (configured && !/^https?:\/\/(localhost|127\.0\.0\.1)(?::\d+)?$/i.test(configured)) return configured;
 
   if (typeof window !== 'undefined') {
     const { protocol, hostname } = window.location;
-    const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
-    return `${protocol}//${isLocalHost ? DEFAULT_DEV_API_HOST : hostname}:3001`;
+    const isBrowserLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
+
+    if (configured) {
+      try {
+        const url = new URL(configured);
+        const isConfiguredLocalhost = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+        if (isConfiguredLocalhost && !isBrowserLocalhost) {
+          url.hostname = hostname;
+        }
+        if (url.hostname === 'localhost' && isBrowserLocalhost) {
+          url.hostname = '127.0.0.1';
+        }
+        return url.origin;
+      } catch {
+        return configured.replace(/\/+$/, '');
+      }
+    }
+
+    return `${protocol}//${isBrowserLocalhost ? '127.0.0.1' : hostname}:3001`;
   }
 
-  return configured || `http://${DEFAULT_DEV_API_HOST}:3001`;
+  return configured ? configured.replace(/\/+$/, '') : 'http://127.0.0.1:3001';
 }
 
 const BASE = resolveApiBase();
@@ -83,6 +97,7 @@ export interface ChatResponse {
   content:       string;
   structured:    ContentBundle | Record<string, unknown>;
   quality_score: number;
+  content_id?:   string | null;
   meta: { credits_used: number; credits_remaining: number; duration_ms: number };
 }
 
@@ -111,8 +126,18 @@ export const profileAPI = {
 // VISUAL
 // ═══════════════════════════════════════════════════════════════════════════════
 export interface VisualJob {
-  id: string; pipeline: string; status: string;
-  assets: VisualAssets; api_cost_vnd: number; created_at: string;
+  id: string;
+  pipeline: 'A' | 'B' | 'C';
+  status: 'queued' | 'processing' | 'done' | 'failed';
+  error_msg?: string;
+  source_type?: string;
+  source_url?: string;
+  product_info: Record<string, unknown>;
+  assets: VisualAssets;
+  api_cost_vnd: number;
+  created_at: string;
+  started_at?: string;
+  completed_at?: string;
 }
 
 export const visualAPI = {
@@ -127,7 +152,15 @@ export const visualAPI = {
 
   uploadPhoto: async (
     file: File,
-    options: { platforms?: string[]; niche?: string } = {}
+    options: {
+      platforms?: string[];
+      niche?: string;
+      productDescription?: string;
+      headline?: string;
+      subline?: string;
+      cta?: string;
+      badge?: string;
+    } = {}
   ): Promise<{ job_id: string }> => {
     const headers = await authHeader();
     delete headers['Content-Type'];
@@ -138,7 +171,14 @@ export const visualAPI = {
       form.append('platforms', platform);
     }
     if (options.niche) form.append('niche', options.niche);
-    const res = await fetch(`${BASE}/api/visual/upload`, { method: 'POST', headers, body: form });
+    if (options.productDescription) form.append('product_description', options.productDescription);
+    if (options.headline) form.append('headline', options.headline);
+    if (options.subline) form.append('subline', options.subline);
+    if (options.cta) form.append('cta', options.cta);
+    if (options.badge) form.append('badge', options.badge);
+    const res = await fetch(`${BASE}/api/visual/upload`, { method: 'POST', headers, body: form }).catch((error) => {
+      throw new Error(`Không kết nối được API upload tại ${BASE}. Kiểm tra backend port 3001 hoặc NEXT_PUBLIC_API_URL. ${(error as Error).message}`);
+    });
     if (!res.ok) await parseApiError(res);
     const data = await res.json();
     return data.data;
@@ -158,7 +198,9 @@ export const visualAPI = {
     }
     if (options.subStyle) form.append('sub_style', options.subStyle);
     if (typeof options.clipDuration === 'number') form.append('clip_duration', String(options.clipDuration));
-    const res = await fetch(`${BASE}/api/visual/upload`, { method: 'POST', headers, body: form });
+    const res = await fetch(`${BASE}/api/visual/upload`, { method: 'POST', headers, body: form }).catch((error) => {
+      throw new Error(`Không kết nối được API upload tại ${BASE}. Kiểm tra backend port 3001 hoặc NEXT_PUBLIC_API_URL. ${(error as Error).message}`);
+    });
     if (!res.ok) await parseApiError(res);
     const data = await res.json();
     return data.data;

@@ -10,11 +10,13 @@ import { withRetry, withTimeout } from '../../lib/resilience.js';
 import { generateImageFromCutout } from '../../agents/openai-image-mini-agent.js';
 import { generateVideoEditPlan } from '../../agents/openai-video-mini-agent.js';
 import { scrapeShopeeUrl } from '../integrations/shopee.js';
-import type { BrandKit, ProductInfo } from '../../../../packages/shared/src/types.js';
 
 const db = () => createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
 const PIPELINE_A_BG_TIMEOUT_MS = 35_000;
 const PIPELINE_A_UPSCALE_TIMEOUT_MS = 45_000;
+const PIPELINE_A_ANALYSIS_TIMEOUT_MS = 35_000;
+const PIPELINE_A_AD_TIMEOUT_MS = 180_000;
+const PIPELINE_B_AD_TIMEOUT_MS = 180_000;
 
 interface VisualProductData {
   name: string;
@@ -42,6 +44,58 @@ interface CreativeDirection {
   textZone: 'top' | 'left' | 'right' | 'bottom';
 }
 
+interface PipelineACopyInput {
+  productDescription?: string;
+  headline?: string;
+  subline?: string;
+  cta?: string;
+  badge?: string;
+  includeText?: boolean;
+}
+
+interface ProductImageCandidate {
+  url: string;
+  buffer: Buffer;
+  width: number;
+  height: number;
+  format?: string;
+  score: number;
+  warnings: string[];
+}
+
+interface PipelineAImageAnalysis {
+  subjectKind: 'product' | 'person' | 'fashion_model' | 'food' | 'home' | 'other';
+  subjectLabel: string;
+  niche: string;
+  style: string;
+  background: string;
+  palette: CreativeDirection['palette'];
+  headline: string;
+  subline: string;
+  cta: string;
+  badge: string;
+  preferredSubjectSide: 'left' | 'right' | 'center' | 'bottom';
+  notes: string;
+}
+
+interface PipelineAAdContent {
+  campaignAngle: string;
+  visualHook: string;
+  keyBenefit: string;
+  audience: string;
+  mood: string;
+  sceneProps: string[];
+  compositionNote: string;
+}
+
+interface PipelineCHighlight {
+  start: number;
+  end: number;
+  hook_text: string;
+  hook_frame_time: number;
+  opening_caption: string;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // QUEUE MANAGER
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -52,6 +106,7 @@ export const visualQueue = {
     platforms: string[];
     pipeline: string;
     niche?: string;
+    copy?: PipelineACopyInput;
     subStyle?: string;
     clipDuration?: number;
   }): Promise<void> {
@@ -68,7 +123,7 @@ export const visualQueue = {
           clipDuration: config.clipDuration,
         });
       } else if (config.pipeline === 'A' && config.source_path) {
-        assets = await runPipelineA(userId, config.source_path, config.platforms, config.niche);
+        assets = await runPipelineA(userId, config.source_path, config.platforms, config.niche, config.copy);
       }
 
       await db().from('visual_jobs').update({
@@ -94,29 +149,21 @@ async function runPipelineA(
   userId: string,
   imagePath: string,
   platforms: string[],
-  niche = 'beauty'
+  niche = 'beauty',
+  copy: PipelineACopyInput = {}
 ): Promise<Record<string, string>> {
   const imageBuffer = await readFile(imagePath);
   const selectedPlatforms = [...new Set(platforms)].slice(0, 5);
+  const analysis = await analyzePipelineAImage(imageBuffer, niche, copy);
+  const resolvedNiche = analysis.niche || niche;
+  const adContent = await generatePipelineAAdContent(analysis, resolvedNiche, copy);
   
-  // Step 1: Remove background
-  const noBgBuffer = await removeBg(imageBuffer).catch((error) => {
-    console.warn(`[Visual] Remove background fallback: ${(error as Error).message}`);
-    return imageBuffer;
-  });
-  
-  // Step 2: Upscale if small
-  const enhanced = imageBuffer.length < 200_000
-    ? await upscaleImage(noBgBuffer).catch((error) => {
-        console.warn(`[Visual] Upscale fallback: ${(error as Error).message}`);
-        return noBgBuffer;
-      })
-    : noBgBuffer;
-  
-  // Step 3: Generate per platform in parallel
+  // Generate a complete ad banner from the uploaded image reference.
   const results: Record<string, string> = {};
   const settled = await Promise.allSettled(selectedPlatforms.map(async (platform) => {
-    const generated = await generatePipelineAAsset(enhanced, niche, platform);
+    const creative = buildPipelineACreativeDirection(analysis, resolvedNiche, platform);
+    applyPipelineACopy(creative, copy);
+    const generated = await generatePipelineAAsset(imageBuffer, resolvedNiche, platform, analysis, creative, adContent);
     const url = await uploadToStorage(generated, `${userId}/banner_${platform}_${Date.now()}.jpg`);
     return { platform, url };
   }));
@@ -157,36 +204,46 @@ async function runPipelineB(
     product = await scrapeProductFallback(productUrl, product);
   }
   
-  // Step 2: Pick best image
-  const bestImageUrl = await rankAndPickBestImage(product.images);
+  // Step 2: Pick and prepare the best source image instead of trusting the first crawled URL.
+  const productReference = await preparePipelineBProductReference(product.images);
+  const imgBuffer = productReference.buffer;
   
-  // Step 3: Remove background
-  const imgBuffer = await downloadBuffer(bestImageUrl);
-  const noBg = await removeBg(imgBuffer);
-  
-  // Step 4: Generate backgrounds per platform
+  // Step 3: Generate complete ad creatives per platform from the product image.
   const results: Record<string, string> = {};
   const niche = inferNiche(product.name);
   const selectedPlatforms = [...new Set(platforms)].slice(0, 5);
   
-  await Promise.all(selectedPlatforms.map(async (platform) => {
+  const settled = await Promise.allSettled(selectedPlatforms.map(async (platform) => {
     const creative = buildCreativeDirection(niche, platform, product);
-    const scene = await generatePhotorealisticProductScene(noBg, niche, platform, product, creative);
-    const withText = await addCreativeTextOverlay(scene, platform, {
-      name:    product.name,
-      price:   product.price,
-      rating:  product.rating,
-      sold:    product.sold,
-      discount: product.discount,
-    }, creative);
+    const withText = await generateCompletePipelineBAd(imgBuffer, niche, platform, product, creative);
     const url = await uploadToStorage(withText, `${userId}/banner_${platform}_${Date.now()}.jpg`);
-    results[`${platform}_banner`] = url;
+    return { platform, url };
   }));
+
+  for (const item of settled) {
+    if (item.status === 'fulfilled') {
+      results[`${item.value.platform}_banner`] = item.value.url;
+      continue;
+    }
+    console.warn(`[Visual] Pipeline B platform render failed: ${item.reason instanceof Error ? item.reason.message : String(item.reason)}`);
+  }
+
+  if (Object.keys(results).length === 0) {
+    const reasons = settled
+      .filter((item): item is PromiseRejectedResult => item.status === 'rejected')
+      .map(item => item.reason instanceof Error ? item.reason.message : String(item.reason))
+      .slice(0, 3)
+      .join('; ');
+    throw new Error(`Pipeline B không tạo được ảnh đầu ra nào${reasons ? `: ${reasons}` : ''}`);
+  }
   
-  // Also generate a creative Instagram carousel when possible.
-  const carouselUrls = await generateCarousel(userId, product, niche, noBg);
-  if (carouselUrls.length > 0) {
-    results['instagram_carousel'] = carouselUrls.join(',');
+  // Carousel is expensive: 5 extra image generations can add several minutes.
+  // Keep it opt-in so the main requested platform exports can finish promptly.
+  if (process.env.PIPELINE_B_ENABLE_CAROUSEL === 'true' && selectedPlatforms.includes('instagram')) {
+    const carouselUrls = await generateCarousel(userId, product, niche, imgBuffer);
+    if (carouselUrls.length > 0) {
+      results['instagram_carousel'] = carouselUrls.join(',');
+    }
   }
   
   return results;
@@ -195,6 +252,45 @@ async function runPipelineB(
 // ═══════════════════════════════════════════════════════════════════════════════
 // PIPELINE C — video raw + AI edit + subtitle
 // ═══════════════════════════════════════════════════════════════════════════════
+async function generateCompletePipelineBAd(
+  productImageBuffer: Buffer,
+  niche: string,
+  platform: string,
+  product: VisualProductData,
+  creative: CreativeDirection
+): Promise<Buffer> {
+  let generated: Buffer;
+  try {
+    generated = await withTimeout(
+      () => generateImageFromCutout({
+        cutoutBuffer: productImageBuffer,
+        niche,
+        platform,
+        productName: shortProductName(product.name),
+        marketingContext: buildPipelineBMarketingContext(product, niche, platform),
+        creativeTheme: creative.theme,
+        colorDirection: `${creative.palette.primary}, ${creative.palette.secondary}, ${creative.palette.accent}`,
+        productPlacement: creative.productPlacement,
+        textZone: creative.textZone,
+        renderMode: 'complete_ad',
+      }),
+      PIPELINE_B_AD_TIMEOUT_MS,
+      `Pipeline B ${platform} complete ad generation timed out after ${PIPELINE_B_AD_TIMEOUT_MS}ms`
+    );
+  } catch (error) {
+    console.warn(`[Visual] Pipeline B AI scene fallback for ${platform}: ${(error as Error).message}`);
+    generated = await generatePhotorealisticProductScene(productImageBuffer, niche, platform, product, creative);
+  }
+
+  return renderPipelineBBanner(generated, platform, {
+    name: product.name,
+    price: product.price,
+    rating: product.rating,
+    sold: product.sold,
+    discount: product.discount,
+  }, creative);
+}
+
 async function runPipelineC(
   userId: string,
   videoPath: string,
@@ -203,16 +299,18 @@ async function runPipelineC(
 
   const { default: fs } = await import('fs');
   const clipDuration = Number.isFinite(options.clipDuration) && (options.clipDuration ?? 0) > 0
-    ? Math.round(options.clipDuration as number)
+    ? Math.round(clamp(options.clipDuration as number, 15, 90))
     : 45;
   const subStyle = options.subStyle || 'tiktok';
   const sourceDuration = await getVideoDuration(videoPath).catch(() => clipDuration);
   const audioPath = buildVisualTempPath(userId, 'transcribe_audio', 'wav');
   const clipPath = buildVisualTempPath(userId, 'clip', 'mp4');
+  const clipAudioPath = buildVisualTempPath(userId, 'clip_audio', 'wav');
   const processedPath = buildVisualTempPath(userId, 'processed', 'mp4');
   const assPath = buildVisualTempPath(userId, 'sub', 'ass');
   const srtPath = buildVisualTempPath(userId, 'sub', 'srt');
   const subtitledPath = buildVisualTempPath(userId, 'final', 'mp4');
+  const trimmedPath = buildVisualTempPath(userId, 'trimmed_final', 'mp4');
   const thumbPath = buildVisualTempPath(userId, 'thumb', 'jpg');
   let hasAudio = true;
   let transcript: Awaited<ReturnType<typeof transcribeVideo>> | null = null;
@@ -224,7 +322,7 @@ async function runPipelineC(
     hasAudio = false;
   }
 
-  // Step 1: Transcribe với Whisper
+  // Step 1: Transcribe audio
   const highlight = normalizeHighlightWindow(
     transcript
       ? await planPipelineCHighlight(transcript, clipDuration, sourceDuration)
@@ -237,24 +335,40 @@ async function runPipelineC(
   
   // Step 3: Cut clip
   await cutVideoClip(videoPath, highlight.start, highlight.end, clipPath, hasAudio);
+  await assertVideoWasCut(clipPath, highlight.end - highlight.start, 'Pipeline C source cut');
   
   // Step 4: Enhance audio + resize to 9:16
   await processVideoForTikTok(clipPath, processedPath, hasAudio);
-  
-  const clipTranscript = transcript
+
+  const slicedTranscript = transcript
     ? sliceTranscriptToWindow(transcript, highlight.start, highlight.end)
     : null;
+  const clipTranscript = hasAudio
+    ? await transcribeCutClipForSubtitles(clipPath, clipAudioPath, slicedTranscript)
+    : null;
   const hasSubtitleData = Boolean(clipTranscript && (clipTranscript.words.length > 0 || clipTranscript.segments.length > 0));
-  const finalVideoPath = hasSubtitleData ? subtitledPath : processedPath;
+  let finalVideoPath = hasSubtitleData ? subtitledPath : processedPath;
+  const openingCaption = buildOpeningCaption(highlight.opening_caption || highlight.hook_text || clipTranscript?.text || '');
   if (clipTranscript && hasSubtitleData) {
     if (clipTranscript.words.length > 0) {
-      generateWordByWordASS(clipTranscript.words, 0, assPath, subStyle);
+      generateWordByWordASS(clipTranscript.words, 0, assPath, subStyle, openingCaption);
     } else {
-      generateSegmentASS(clipTranscript.segments, assPath, subStyle);
+      generateSegmentASS(clipTranscript.segments, assPath, subStyle, openingCaption);
     }
     await burnSubtitle(processedPath, assPath, subtitledPath);
     generateSRT(clipTranscript.segments, clipTranscript.words, srtPath);
+  } else if (openingCaption) {
+    generateSegmentASS([], assPath, subStyle, openingCaption);
+    await burnSubtitle(processedPath, assPath, subtitledPath);
+    finalVideoPath = subtitledPath;
   }
+
+  finalVideoPath = await ensureVideoDurationLimit(
+    finalVideoPath,
+    trimmedPath,
+    Math.max(1, highlight.end - highlight.start),
+    hasAudio
+  );
   
   // Step 7: Extract best thumbnail
   const clipLength = Math.max(1, highlight.end - highlight.start);
@@ -274,7 +388,7 @@ async function runPipelineC(
   ]);
   
   // Cleanup
-  [audioPath, clipPath, processedPath, assPath, srtPath, subtitledPath, thumbPath]
+  [audioPath, clipAudioPath, clipPath, processedPath, assPath, srtPath, subtitledPath, trimmedPath, thumbPath]
     .forEach(p => fs.unlink(p, () => {}));
 
   return {
@@ -294,7 +408,8 @@ async function removeBg(buffer: Buffer): Promise<Buffer> {
   }
 
   const formData = new FormData();
-  formData.append('image_file', new Blob([buffer]), 'product.jpg');
+  const blobPart = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+  formData.append('image_file', new Blob([blobPart]), 'product.jpg');
   formData.append('size', 'auto');
   formData.append('type', 'product');
   formData.append('format', 'png');
@@ -318,7 +433,8 @@ async function removeBg(buffer: Buffer): Promise<Buffer> {
 async function upscaleImage(buffer: Buffer): Promise<Buffer> {
   if (!process.env.REPLICATE_API_TOKEN) return buffer;
 
-  const { Replicate } = await import('replicate');
+  const replicateModuleName = 'replicate';
+  const { default: Replicate } = await import(replicateModuleName);
   const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
   const base64 = buffer.toString('base64');
@@ -343,7 +459,7 @@ async function generateBackground(prompt: string, platform: string): Promise<Buf
     zalo: '1536x1024',
   };
   const size = sizeMap[platform] ?? '1024x1024';
-  const model = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2';
+  const model = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1.5';
   const quality = process.env.OPENAI_IMAGE_QUALITY || 'high';
 
   if (!process.env.OPENAI_API_KEY) {
@@ -370,18 +486,431 @@ async function generateBackground(prompt: string, platform: string): Promise<Buf
   }
 }
 
-async function generatePipelineAAsset(productBuffer: Buffer, niche: string, platform: string): Promise<Buffer> {
+async function analyzePipelineAImage(buffer: Buffer, fallbackNiche: string, copy: PipelineACopyInput = {}): Promise<PipelineAImageAnalysis> {
+  const fallback = defaultPipelineAAnalysis(fallbackNiche, copy);
+  if (!process.env.OPENAI_API_KEY) return fallback;
+
   try {
-    return await generateImageFromCutout({
-      cutoutBuffer: productBuffer,
-      niche,
-      platform,
-    });
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const image = await prepareVisionImageDataUrl(buffer);
+    const response = await withTimeout(
+      () => openai.chat.completions.create({
+        model: process.env.OPENAI_VISION_MODEL || 'gpt-5.5',
+        response_format: { type: 'json_object' },
+        max_tokens: 420,
+        messages: [
+          {
+            role: 'system',
+            content: [
+              'You are an art director for e-commerce and social ads.',
+              'Read the uploaded image first and treat the visible product/person/outfit as the source of truth.',
+              'The user description is only supporting context for niche, benefits, and audience; never let it replace or contradict what is visible in the image.',
+              'Identify the subject, define style, choose a layout with clean text space, pick a color palette, and propose short Vietnamese overlay copy.',
+              'Do not invent brands, materials, features, discounts, or product claims unless they are visible in the image or explicitly described by the user.',
+              'Return strict JSON only.',
+            ].join(' '),
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: [
+                  'Return this JSON shape:',
+                  '{"subjectKind":"product|person|fashion_model|food|home|other","subjectLabel":"short Vietnamese label from the image","niche":"beauty|tech|food|fashion|home|health","style":"premium studio style","background":"clean contextual background","palette":{"primary":"#111111","secondary":"#F7EEDF","accent":"#B91C1C","text":"#FFFFFF"},"headline":"ĐÁNG THỬ HÔM NAY","subline":"Lợi ích ngắn phù hợp sản phẩm","cta":"Xem ngay","badge":"HOT","preferredSubjectSide":"left|right|center|bottom","notes":"short visual notes based on image"}',
+                  copy.productDescription ? `Supporting user description, use only if consistent with the image: ${copy.productDescription}` : '',
+                  copy.headline ? `Legacy optional headline direction, use only if consistent with the image: ${copy.headline}` : '',
+                  copy.subline ? `Legacy optional subline direction, use only if consistent with the image: ${copy.subline}` : '',
+                  copy.cta ? `Legacy optional CTA direction: ${copy.cta}` : '',
+                  copy.badge ? `Legacy optional badge direction: ${copy.badge}` : '',
+                  'Keep overlay copy short, natural Vietnamese with full accents. If the image contains a fashion model or person, preserve the exact person and outfit as the hero subject.',
+                ].filter(Boolean).join('\n'),
+              },
+              { type: 'image_url', image_url: { url: image, detail: 'low' } },
+            ] as any,
+          },
+        ],
+      } as any),
+      PIPELINE_A_ANALYSIS_TIMEOUT_MS,
+      `Pipeline A image analysis timed out after ${PIPELINE_A_ANALYSIS_TIMEOUT_MS}ms`
+    );
+
+    const parsed = JSON.parse(response.choices[0]?.message?.content ?? '{}') as Partial<PipelineAImageAnalysis>;
+    return normalizePipelineAAnalysis(parsed, fallback);
   } catch (error) {
-    console.warn(`[Visual] OpenAI image mini-agent fallback for ${platform}: ${(error as Error).message}`);
-    const bgPrompt = buildBgPrompt(niche, platform);
-    const bgBuffer = await generateBackground(bgPrompt, platform);
-    return compositeImages(bgBuffer, productBuffer, platform);
+    console.warn(`[Visual] Pipeline A image analysis fallback: ${(error as Error).message}`);
+    return fallback;
+  }
+}
+
+async function prepareVisionImageDataUrl(buffer: Buffer): Promise<string> {
+  const { default: sharp } = await import('sharp');
+  const normalized = await sharp(buffer, { failOn: 'none' })
+    .rotate()
+    .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 86 })
+    .toBuffer();
+  return `data:image/jpeg;base64,${normalized.toString('base64')}`;
+}
+
+function defaultPipelineAAnalysis(niche: string, copy: PipelineACopyInput = {}): PipelineAImageAnalysis {
+  const normalizedNiche = normalizeNiche(niche);
+  const palette = defaultPaletteForNiche(normalizedNiche);
+  const describedSubject = subjectLabelFromDescription(copy.productDescription);
+  return {
+    subjectKind: normalizedNiche === 'fashion' ? 'fashion_model' : 'product',
+    subjectLabel: describedSubject || (normalizedNiche === 'fashion' ? 'Bộ sưu tập thời trang' : 'Sản phẩm chính'),
+    niche: normalizedNiche,
+    style: normalizedNiche === 'fashion' ? 'Editorial cao cấp' : 'Studio quảng cáo cao cấp',
+    background: normalizedNiche === 'fashion' ? 'studio tối giản với ánh sáng thời trang mềm' : 'studio tối giản với ánh sáng mềm và sạch',
+    palette,
+    headline: cleanOverlayCopy(copy.headline, normalizedNiche === 'fashion' ? 'BỘ SƯU TẬP MỚI' : 'ĐÁNG THỬ HÔM NAY', 34).toUpperCase(),
+    subline: cleanOverlayCopy(copy.subline, normalizedNiche === 'fashion' ? 'Phong cách gọn gàng, dễ nổi bật' : benefitByNiche(normalizedNiche), 58),
+    cta: cleanOverlayCopy(copy.cta, 'Xem ngay', 14),
+    badge: cleanOverlayCopy(copy.badge, normalizedNiche === 'fashion' ? 'MỚI' : 'HOT', 18).toUpperCase(),
+    preferredSubjectSide: 'right',
+    notes: copy.productDescription
+      ? `Ảnh là nguồn nhận diện sản phẩm chính; dùng mô tả này làm ngữ cảnh hỗ trợ nếu phù hợp: ${copy.productDescription}`
+      : 'Tạo banner thương mại sạch, giữ sản phẩm trong ảnh làm chủ thể và chừa vùng trống cho chữ.',
+  };
+}
+
+async function generatePipelineAAdContent(
+  analysis: PipelineAImageAnalysis,
+  niche: string,
+  copy: PipelineACopyInput
+): Promise<PipelineAAdContent> {
+  const fallback = defaultPipelineAAdContent(analysis, niche, copy);
+  if (!process.env.OPENAI_API_KEY) return fallback;
+
+  try {
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const response = await withTimeout(
+      () => openai.chat.completions.create({
+        model: process.env.OPENAI_VISION_MODEL || 'gpt-5.5',
+        response_format: { type: 'json_object' },
+        max_tokens: 360,
+        messages: [
+          {
+            role: 'system',
+            content: [
+              'You are a senior ad creative strategist.',
+              'Create visual advertising content for a banner from the image-based product/subject analysis.',
+              'The uploaded image analysis is the source of truth; the user description only supports benefits, audience, and positioning.',
+              'The content must be expressed visually through scene, props, lighting, composition, and mood.',
+              'Do not create claims, use cases, ingredients, specs, or product categories that conflict with the observed subject.',
+              'Do not rely on readable text inside the image.',
+              'Return strict JSON only.',
+            ].join(' '),
+          },
+          {
+            role: 'user',
+            content: [
+              `Niche: ${niche}`,
+              `Subject: ${analysis.subjectLabel}`,
+              `Subject kind: ${analysis.subjectKind}`,
+              copy.productDescription ? `Supporting product description, use only if consistent with the observed subject: ${copy.productDescription}` : '',
+              `Style: ${analysis.style}`,
+              `Existing notes: ${analysis.notes}`,
+              copy.headline ? `Optional user headline direction: ${copy.headline}` : '',
+              copy.subline ? `Optional user subline direction: ${copy.subline}` : '',
+              'Return JSON shape: {"campaignAngle":"short angle","visualHook":"what should catch attention visually","keyBenefit":"benefit to communicate visually","audience":"target audience","mood":"premium mood","sceneProps":["prop 1","prop 2","prop 3"],"compositionNote":"short art direction"}',
+            ].filter(Boolean).join('\n'),
+          },
+        ],
+      } as any),
+      25_000,
+      'Pipeline A ad content generation timed out after 25000ms'
+    );
+
+    const parsed = JSON.parse(response.choices[0]?.message?.content ?? '{}') as Partial<PipelineAAdContent>;
+    return normalizePipelineAAdContent(parsed, fallback);
+  } catch (error) {
+    console.warn(`[Visual] Pipeline A ad content fallback: ${(error as Error).message}`);
+    return fallback;
+  }
+}
+
+function defaultPipelineAAdContent(
+  analysis: PipelineAImageAnalysis,
+  niche: string,
+  copy: PipelineACopyInput
+): PipelineAAdContent {
+  const nicheContent: Record<string, Omit<PipelineAAdContent, 'campaignAngle'>> = {
+    beauty: {
+      visualHook: 'glowing skin ritual, clean premium vanity moment',
+      keyBenefit: 'fresh, confident daily beauty routine',
+      audience: 'beauty shoppers looking for a polished daily upgrade',
+      mood: 'soft, luminous, refined',
+      sceneProps: ['clean vanity surface', 'soft fabric', 'subtle glass or floral accent'],
+      compositionNote: 'make the product feel aspirational and fresh without clutter',
+    },
+    tech: {
+      visualHook: 'sleek modern setup with clear subject silhouette',
+      keyBenefit: 'smarter, cleaner, more efficient everyday use',
+      audience: 'tech buyers who value performance and modern design',
+      mood: 'precise, premium, futuristic',
+      sceneProps: ['matte desk surface', 'subtle light streak', 'minimal metallic accent'],
+      compositionNote: 'use controlled highlights and strong separation from the background',
+    },
+    food: {
+      visualHook: 'fresh appetizing scene with natural ingredients',
+      keyBenefit: 'easy, satisfying taste moment',
+      audience: 'busy shoppers looking for tasty convenience',
+      mood: 'warm, fresh, inviting',
+      sceneProps: ['clean kitchen surface', 'fresh ingredient accents', 'natural daylight'],
+      compositionNote: 'make the food/product feel appetizing, bright, and easy to choose',
+    },
+    fashion: {
+      visualHook: 'editorial fashion moment focused on fabric, silhouette, and confidence',
+      keyBenefit: 'standout style for a polished occasion',
+      audience: 'fashion shoppers looking for an elegant statement piece',
+      mood: 'elegant, classic, premium',
+      sceneProps: ['minimal studio backdrop', 'soft fabric texture', 'subtle warm highlight'],
+      compositionNote: 'preserve outfit identity and create a campaign-ready fashion banner',
+    },
+    home: {
+      visualHook: 'calm modern home scene with tasteful styling',
+      keyBenefit: 'cleaner, warmer, more organized living space',
+      audience: 'home shoppers improving their everyday environment',
+      mood: 'calm, warm, modern',
+      sceneProps: ['soft natural textile', 'clean tabletop', 'subtle plant or decor accent'],
+      compositionNote: 'make the scene feel livable and premium, not staged with clutter',
+    },
+    health: {
+      visualHook: 'fresh wellness routine with clean active-lifestyle cues',
+      keyBenefit: 'simple daily care and better habits',
+      audience: 'wellness shoppers who want practical daily support',
+      mood: 'fresh, clean, trustworthy',
+      sceneProps: ['bright neutral surface', 'soft green accent', 'clean clinical-lifestyle detail'],
+      compositionNote: 'communicate trust and freshness with restrained wellness styling',
+    },
+  };
+
+  const base = nicheContent[niche] ?? nicheContent.beauty;
+  return {
+    campaignAngle: copy.headline || analysis.headline || subjectLabelFromDescription(copy.productDescription) || benefitByNiche(niche),
+    ...base,
+    keyBenefit: copy.productDescription
+      ? cleanOverlayCopy(copy.productDescription, base.keyBenefit, 100)
+      : base.keyBenefit,
+  };
+}
+
+function subjectLabelFromDescription(description?: string): string {
+  if (!description) return '';
+  return cleanOverlayCopy(description, '', 56)
+    .replace(/^(sản phẩm|san pham|product|mô tả|mo ta|description)\s*[:\-]\s*/i, '');
+}
+
+function normalizePipelineAAdContent(input: Partial<PipelineAAdContent>, fallback: PipelineAAdContent): PipelineAAdContent {
+  return {
+    campaignAngle: cleanOverlayCopy(input.campaignAngle, fallback.campaignAngle, 80),
+    visualHook: cleanOverlayCopy(input.visualHook, fallback.visualHook, 120),
+    keyBenefit: cleanOverlayCopy(input.keyBenefit, fallback.keyBenefit, 100),
+    audience: cleanOverlayCopy(input.audience, fallback.audience, 100),
+    mood: cleanOverlayCopy(input.mood, fallback.mood, 80),
+    sceneProps: Array.isArray(input.sceneProps)
+      ? input.sceneProps.filter((item): item is string => typeof item === 'string').slice(0, 5).map(item => cleanOverlayCopy(item, '', 60)).filter(Boolean)
+      : fallback.sceneProps,
+    compositionNote: cleanOverlayCopy(input.compositionNote, fallback.compositionNote, 140),
+  };
+}
+
+function normalizePipelineAAnalysis(
+  input: Partial<PipelineAImageAnalysis>,
+  fallback: PipelineAImageAnalysis
+): PipelineAImageAnalysis {
+  const subjectKind = normalizeSubjectKind(input.subjectKind, fallback.subjectKind);
+  const niche = normalizeNiche(input.niche || fallback.niche);
+  return {
+    subjectKind,
+    subjectLabel: cleanOverlayCopy(input.subjectLabel, fallback.subjectLabel, 56),
+    niche,
+    style: cleanOverlayCopy(input.style, fallback.style, 64),
+    background: cleanOverlayCopy(input.background, fallback.background, 120),
+    palette: normalizePalette(input.palette, defaultPaletteForNiche(niche)),
+    headline: cleanOverlayCopy(input.headline, fallback.headline, 34).toUpperCase(),
+    subline: cleanOverlayCopy(input.subline, fallback.subline, 58),
+    cta: cleanOverlayCopy(input.cta, fallback.cta, 14),
+    badge: cleanOverlayCopy(input.badge, fallback.badge, 18).toUpperCase(),
+    preferredSubjectSide: normalizeSubjectSide(input.preferredSubjectSide, fallback.preferredSubjectSide),
+    notes: cleanOverlayCopy(input.notes, fallback.notes, 180),
+  };
+}
+
+function normalizeSubjectKind(value: unknown, fallback: PipelineAImageAnalysis['subjectKind']): PipelineAImageAnalysis['subjectKind'] {
+  return isOneOf(value, ['product', 'person', 'fashion_model', 'food', 'home', 'other']) ? value : fallback;
+}
+
+function normalizeSubjectSide(value: unknown, fallback: PipelineAImageAnalysis['preferredSubjectSide']): PipelineAImageAnalysis['preferredSubjectSide'] {
+  return isOneOf(value, ['left', 'right', 'center', 'bottom']) ? value : fallback;
+}
+
+function normalizeNiche(value: unknown): string {
+  return isOneOf(value, ['beauty', 'tech', 'food', 'fashion', 'home', 'health']) ? value : 'beauty';
+}
+
+function isOneOf<T extends string>(value: unknown, values: readonly T[]): value is T {
+  return typeof value === 'string' && (values as readonly string[]).includes(value);
+}
+
+function cleanOverlayCopy(value: unknown, fallback: string, maxLength: number): string {
+  const cleaned = typeof value === 'string'
+    ? value.replace(/\s+/g, ' ').replace(/[<>]/g, '').trim()
+    : '';
+  return (cleaned || fallback).slice(0, maxLength);
+}
+
+function normalizePalette(input: unknown, fallback: CreativeDirection['palette']): CreativeDirection['palette'] {
+  const value = typeof input === 'object' && input ? input as Partial<CreativeDirection['palette']> : {};
+  return {
+    primary: normalizeHexColor(value.primary, fallback.primary),
+    secondary: normalizeHexColor(value.secondary, fallback.secondary),
+    accent: normalizeHexColor(value.accent, fallback.accent),
+    text: normalizeHexColor(value.text, fallback.text),
+  };
+}
+
+function normalizeHexColor(value: unknown, fallback: string): string {
+  return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
+}
+
+function defaultPaletteForNiche(niche: string): CreativeDirection['palette'] {
+  return ({
+    beauty: { primary: '#D9468F', secondary: '#FFF1F2', accent: '#FACC15', text: '#FFFFFF' },
+    tech: { primary: '#2563EB', secondary: '#E0F2FE', accent: '#22D3EE', text: '#FFFFFF' },
+    food: { primary: '#EA580C', secondary: '#FFF7ED', accent: '#FACC15', text: '#FFFFFF' },
+    fashion: { primary: '#7F1D1D', secondary: '#F7EEDF', accent: '#D4AF37', text: '#FFFFFF' },
+    home: { primary: '#047857', secondary: '#ECFDF5', accent: '#A7F3D0', text: '#FFFFFF' },
+    health: { primary: '#0F766E', secondary: '#ECFEFF', accent: '#67E8F9', text: '#FFFFFF' },
+  } as Record<string, CreativeDirection['palette']>)[niche] ?? {
+    primary: '#111827',
+    secondary: '#F3F4F6',
+    accent: '#FACC15',
+    text: '#FFFFFF',
+  };
+}
+
+function buildPipelineACreativeDirection(
+  analysis: PipelineAImageAnalysis,
+  niche: string,
+  platform: string
+): CreativeDirection {
+  const side = platform === 'tiktok' ? 'bottom' : analysis.preferredSubjectSide;
+  const productPlacement = side === 'left' || side === 'right' || side === 'bottom' ? side : defaultProductPlacementForPlatform(platform);
+  const textZone = productPlacement === 'right'
+    ? 'left'
+    : productPlacement === 'left'
+      ? 'right'
+      : platform === 'instagram'
+        ? 'bottom'
+        : 'top';
+
+  return {
+    theme: `${analysis.style}: ${analysis.background}`,
+    palette: analysis.palette,
+    headline: platform === 'youtube' && analysis.headline.length > 24
+      ? analysis.badge
+      : analysis.headline,
+    subline: analysis.subline || benefitByNiche(niche),
+    cta: analysis.cta || 'Mua ngay',
+    badge: analysis.badge || 'NEW',
+    productPlacement,
+    textZone,
+  };
+}
+
+function applyPipelineACopy(creative: CreativeDirection, copy: PipelineACopyInput): void {
+  const headline = cleanOverlayCopy(copy.headline, '', 42);
+  const subline = cleanOverlayCopy(copy.subline, '', 72);
+  const cta = cleanOverlayCopy(copy.cta, '', 18);
+  const badge = cleanOverlayCopy(copy.badge, '', 22);
+  const description = cleanOverlayCopy(copy.productDescription, '', 120);
+
+  if (headline) creative.headline = headline.toUpperCase();
+  if (subline) creative.subline = subline;
+  else if (description && creative.subline.length < 12) creative.subline = limitWords(description, 11);
+  if (cta) creative.cta = cta;
+  if (badge) creative.badge = badge.toUpperCase();
+}
+
+function defaultProductPlacementForPlatform(platform: string): CreativeDirection['productPlacement'] {
+  return ({
+    tiktok: 'bottom',
+    facebook: 'right',
+    instagram: 'center',
+    youtube: 'right',
+    zalo: 'right',
+  } as Record<string, CreativeDirection['productPlacement']>)[platform] ?? 'right';
+}
+
+function buildPipelineAMarketingContext(
+  analysis: PipelineAImageAnalysis,
+  platform: string,
+  adContent: PipelineAAdContent
+): string {
+  return [
+    `Use the uploaded image as the primary product/subject identity reference and preserve the visible item, packaging, person, outfit, shape, and color family.`,
+    `User description and niche are supporting context only; do not replace the observed subject with a different product.`,
+    `Create a complete premium ${platform} advertising banner from that reference.`,
+    `Subject: ${analysis.subjectLabel}.`,
+    analysis.notes ? `User/product brief: ${analysis.notes}.` : '',
+    `Niche: ${analysis.niche}.`,
+    `Style: ${analysis.style}.`,
+    `Background direction: ${analysis.background}.`,
+    `Campaign angle: ${adContent.campaignAngle}.`,
+    `Visual hook: ${adContent.visualHook}.`,
+    `Key benefit to communicate visually: ${adContent.keyBenefit}.`,
+    `Target audience: ${adContent.audience}.`,
+    `Mood: ${adContent.mood}.`,
+    `Suggested supporting props: ${adContent.sceneProps.join(', ')}.`,
+    `Composition note: ${adContent.compositionNote}.`,
+    `Commercial art direction: cohesive lighting, realistic scale, polished campaign composition, clean negative space for later text overlay, no manual cutout/composite look.`,
+    `Keep the hero subject easy to recognize and do not duplicate it into multiple conflicting products.`,
+    `Do not add readable text, slogans, UI, logos, price tags, watermarks, or fake typography.`,
+    analysis.notes,
+  ].filter(Boolean).join(', ');
+}
+
+async function generatePipelineAAsset(
+  productBuffer: Buffer,
+  niche: string,
+  platform: string,
+  analysis: PipelineAImageAnalysis,
+  creative: CreativeDirection,
+  adContent: PipelineAAdContent
+): Promise<Buffer> {
+  try {
+    const generated = await withTimeout(
+      () => generateImageFromCutout({
+        cutoutBuffer: productBuffer,
+        niche,
+        platform,
+        productName: analysis.subjectLabel,
+        subjectKind: analysis.subjectKind,
+        marketingContext: buildPipelineAMarketingContext(analysis, platform, adContent),
+        creativeTheme: creative.theme,
+        colorDirection: `${creative.palette.primary}, ${creative.palette.secondary}, ${creative.palette.accent}`,
+        overlayTextIntent: `${creative.badge}; headline "${creative.headline}"; subline "${creative.subline}"; CTA "${creative.cta}"`,
+        productPlacement: creative.productPlacement,
+        textZone: creative.textZone,
+        renderMode: 'complete_ad',
+      }),
+      PIPELINE_A_AD_TIMEOUT_MS,
+      `Pipeline A ${platform} complete ad generation timed out after ${PIPELINE_A_AD_TIMEOUT_MS}ms`
+    );
+    return renderPipelineBBanner(
+      generated,
+      platform,
+      { name: analysis.subjectLabel || adContent.campaignAngle || 'Sản phẩm' },
+      creative,
+      'AI product banner'
+    );
+  } catch (error) {
+    throw new Error(`Pipeline A ${platform} OpenAI banner generation failed: ${(error as Error).message}`);
   }
 }
 
@@ -507,55 +1036,240 @@ async function addCreativeTextOverlay(
   const w = meta.width ?? 1080;
   const h = meta.height ?? 1080;
   const zone = getTextZone(w, h, creative.textZone);
-  const headlineLines = wrapText(creative.headline, platform === 'tiktok' ? 18 : 22, 2);
-  const sublineLines = wrapText(creative.subline, platform === 'tiktok' ? 28 : 34, 2);
+  const pad = Math.max(22, Math.round(Math.min(w, h) * 0.032));
+  const maxTextWidth = zone.width - pad * 2;
+  const headlineSize = fitTextSize(creative.headline, maxTextWidth, platform === 'tiktok' ? 82 : 64, platform === 'zalo' ? 36 : 42);
+  const sublineSize = fitTextSize(creative.subline, maxTextWidth, platform === 'tiktok' ? 33 : 27, 18);
+  const headlineLines = wrapTextByWidth(creative.headline, maxTextWidth, headlineSize, 2);
+  const sublineLines = wrapTextByWidth(creative.subline, maxTextWidth, sublineSize, 2);
   const price = product.price ? `${product.price.toLocaleString('vi-VN')}d` : '';
-  const social = product.rating ? `${product.rating.toFixed(1)} sao - da ban ${(product.sold ?? 0).toLocaleString('vi-VN')}+` : '';
-  const badge = product.discount ? `GIAM ${product.discount}%` : creative.badge;
-  const headlineSize = platform === 'tiktok' ? 76 : platform === 'instagram' ? 58 : 54;
-  const sublineSize = platform === 'tiktok' ? 31 : 25;
-  const priceSize = platform === 'tiktok' ? 46 : 38;
+  const social = product.rating ? `${product.rating.toFixed(1)} sao - đã bán ${(product.sold ?? 0).toLocaleString('vi-VN')}+` : '';
+  const badge = product.discount ? `GIẢM ${product.discount}%` : creative.badge;
   const palette = creative.palette;
+  const textColor = readableTextColor(palette.text);
+  const mutedColor = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.86)' : 'rgba(17,24,39,0.78)';
+  const panelFill = textColor === '#FFFFFF' ? 'rgba(17,24,39,0.34)' : 'rgba(255,255,255,0.68)';
+  const panelStroke = textColor === '#FFFFFF' ? 'rgba(255,255,255,0.18)' : 'rgba(17,24,39,0.10)';
+  const badgeFill = palette.accent;
+  const badgeText = contrastTextColor(badgeFill);
+  const headlineY = zone.y + pad + 82;
+  const headlineLineGap = Math.round(headlineSize * 1.04);
+  const sublineY = headlineY + headlineLines.length * headlineLineGap + Math.round(sublineSize * 0.9);
+  const sublineLineGap = Math.round(sublineSize * 1.35);
+  const ctaWidth = Math.min(Math.max(132, creative.cta.length * 13 + 48), Math.max(120, zone.width - pad * 2));
+  const ctaHeight = Math.max(42, Math.round(Math.min(w, h) * 0.048));
+  const ctaX = zone.x + pad;
+  const ctaY = Math.min(
+    zone.y + zone.height - pad - ctaHeight,
+    sublineY + sublineLines.length * sublineLineGap + Math.round(sublineSize * 0.85)
+  );
+  const priceY = ctaY - 22;
 
   const svgText = `
     <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
-          <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.26"/>
+          <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#000000" flood-opacity="0.20"/>
         </filter>
       </defs>
-      <rect x="${zone.x}" y="${zone.y}" width="${zone.width}" height="${zone.height}" rx="26" fill="rgba(0,0,0,0.20)" filter="url(#softShadow)"/>
-      <rect x="${zone.x + 18}" y="${zone.y + 18}" width="${Math.min(230, zone.width - 36)}" height="42" rx="21" fill="${palette.accent}"/>
-      <text x="${zone.x + 34}" y="${zone.y + 47}" font-family="Arial, sans-serif" font-size="20" font-weight="800" fill="#111827">${escapeXml(badge)}</text>
+      <rect x="${zone.x}" y="${zone.y}" width="${zone.width}" height="${zone.height}" rx="24" fill="${panelFill}" stroke="${panelStroke}" filter="url(#softShadow)"/>
+      <rect x="${zone.x + pad}" y="${zone.y + pad}" width="${Math.min(Math.max(88, badge.length * 11 + 38), zone.width - pad * 2)}" height="38" rx="19" fill="${badgeFill}"/>
+      <text x="${zone.x + pad + 19}" y="${zone.y + pad + 25}" font-family="Inter, Arial, sans-serif" font-size="17" font-weight="800" letter-spacing="1.8" fill="${badgeText}">${escapeXml(badge)}</text>
       ${headlineLines.map((line, index) =>
-        `<text x="${zone.x + 26}" y="${zone.y + 112 + index * (headlineSize + 4)}" font-family="Arial, sans-serif" font-size="${headlineSize}" font-weight="900" fill="${palette.text}">${escapeXml(line)}</text>`
+        `<text x="${zone.x + pad}" y="${headlineY + index * headlineLineGap}" font-family="Inter, Arial, sans-serif" font-size="${headlineSize}" font-weight="900" letter-spacing="0" fill="${textColor}">${escapeXml(line)}</text>`
       ).join('')}
       ${sublineLines.map((line, index) =>
-        `<text x="${zone.x + 28}" y="${zone.y + 232 + headlineLines.length * 18 + index * (sublineSize + 8)}" font-family="Arial, sans-serif" font-size="${sublineSize}" font-weight="600" fill="rgba(255,255,255,0.88)">${escapeXml(line)}</text>`
+        `<text x="${zone.x + pad}" y="${sublineY + index * sublineLineGap}" font-family="Inter, Arial, sans-serif" font-size="${sublineSize}" font-weight="600" fill="${mutedColor}">${escapeXml(line)}</text>`
       ).join('')}
-      ${price ? `<text x="${zone.x + 28}" y="${zone.y + zone.height - 78}" font-family="Arial, sans-serif" font-size="${priceSize}" font-weight="900" fill="${palette.accent}">${escapeXml(price)}</text>` : ''}
-      ${social ? `<text x="${zone.x + 28}" y="${zone.y + zone.height - 36}" font-family="Arial, sans-serif" font-size="21" font-weight="600" fill="rgba(255,255,255,0.82)">${escapeXml(social)}</text>` : ''}
-      <rect x="${zone.x + zone.width - 184}" y="${zone.y + zone.height - 76}" width="154" height="46" rx="23" fill="${palette.primary}"/>
-      <text x="${zone.x + zone.width - 158}" y="${zone.y + zone.height - 46}" font-family="Arial, sans-serif" font-size="19" font-weight="800" fill="#ffffff">${escapeXml(creative.cta)}</text>
+      ${price ? `<text x="${zone.x + pad}" y="${priceY}" font-family="Inter, Arial, sans-serif" font-size="${Math.round(headlineSize * 0.58)}" font-weight="900" fill="${palette.accent}">${escapeXml(price)}</text>` : ''}
+      ${social ? `<text x="${zone.x + pad}" y="${priceY + 34}" font-family="Inter, Arial, sans-serif" font-size="19" font-weight="600" fill="${mutedColor}">${escapeXml(social)}</text>` : ''}
+      <rect x="${ctaX}" y="${ctaY}" width="${ctaWidth}" height="${ctaHeight}" rx="${Math.round(ctaHeight / 2)}" fill="${palette.primary}"/>
+      <text x="${ctaX + 24}" y="${ctaY + Math.round(ctaHeight * 0.64)}" font-family="Inter, Arial, sans-serif" font-size="${Math.min(20, Math.max(16, ctaHeight - 24))}" font-weight="800" fill="${contrastTextColor(palette.primary)}">${escapeXml(creative.cta)}</text>
     </svg>`;
 
   return sharp(buffer).composite([{ input: Buffer.from(svgText), blend: 'over' }]).jpeg({ quality: 95 }).toBuffer();
 }
 
+async function renderPipelineBBanner(
+  buffer: Buffer,
+  platform: string,
+  product: { name: string; price?: number; rating?: number; sold?: number; discount?: number },
+  creative: CreativeDirection,
+  sourceLabel = 'Lazada/Shopee deal'
+): Promise<Buffer> {
+  const { default: sharp } = await import('sharp');
+  const dimensions = platformDimensions(platform);
+  const normalized = await sharp(buffer, { failOn: 'none' })
+    .resize(dimensions.width, dimensions.height, { fit: 'cover' })
+    .jpeg({ quality: 96 })
+    .toBuffer();
+  const meta = await sharp(normalized).metadata();
+  const w = meta.width ?? 1080;
+  const h = meta.height ?? 1080;
+  const layout = getPipelineBTextLayout(w, h, platform, creative.textZone);
+  const pad = layout.pad;
+  const maxTextWidth = layout.width - pad * 2;
+  const productName = titleCaseVi(cleanMarketingTitle(product.name));
+  const headline = limitWords(creative.headline || productName, platform === 'tiktok' ? 6 : 5);
+  const subline = limitWords(creative.subline || productName, platform === 'tiktok' ? 12 : 10);
+  const headlineSize = fitTextSize(headline, maxTextWidth, layout.headlineSize, layout.minHeadlineSize);
+  const sublineSize = fitTextSize(subline, maxTextWidth, layout.sublineSize, 18);
+  const headlineLines = wrapTextByWidth(headline, maxTextWidth, headlineSize, 2);
+  const sublineLines = wrapTextByWidth(subline, maxTextWidth, sublineSize, 2);
+  const price = formatVnd(product.price);
+  const originalPrice = product.discount && product.price
+    ? `Tiết kiệm ${product.discount}%`
+    : socialProofText(product);
+  const badge = product.discount ? `Giảm ${product.discount}%` : creative.badge;
+  const badgeText = titleCaseVi(limitWords(badge, 4));
+  const textColor = '#FFFFFF';
+  const mutedColor = 'rgba(255,255,255,0.82)';
+  const accent = creative.palette.accent || '#FDE047';
+  const accentText = contrastTextColor(accent);
+  const cta = creative.cta || 'Xem deal';
+  const ctaWidth = Math.min(Math.max(138, cta.length * 12 + 56), maxTextWidth);
+  const ctaHeight = Math.round(Math.max(42, Math.min(w, h) * 0.055));
+  const headlineY = layout.y + pad + layout.badgeHeight + Math.round(headlineSize * 1.12);
+  const headlineGap = Math.round(headlineSize * 1.05);
+  const sublineY = headlineY + headlineLines.length * headlineGap + Math.round(sublineSize * 0.9);
+  const sublineGap = Math.round(sublineSize * 1.32);
+  const priceY = sublineY + sublineLines.length * sublineGap + Math.round(headlineSize * 0.78);
+  const ctaY = Math.min(layout.y + layout.height - pad - ctaHeight, priceY + Math.round(headlineSize * 0.42));
+  const scrim = buildPipelineBScrim(w, h, creative.textZone);
+
+  const svg = `
+    <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="scrim" x1="${scrim.x1}" y1="${scrim.y1}" x2="${scrim.x2}" y2="${scrim.y2}">
+          <stop offset="0%" stop-color="#05070D" stop-opacity="${scrim.strong}"/>
+          <stop offset="58%" stop-color="#05070D" stop-opacity="${scrim.mid}"/>
+          <stop offset="100%" stop-color="#05070D" stop-opacity="0"/>
+        </linearGradient>
+        <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="7" stdDeviation="12" flood-color="#000000" flood-opacity="0.34"/>
+        </filter>
+      </defs>
+      <rect width="${w}" height="${h}" fill="url(#scrim)"/>
+      <g filter="url(#shadow)">
+        <rect x="${layout.x + pad}" y="${layout.y + pad}" width="${Math.min(Math.max(102, badgeText.length * 10 + 38), maxTextWidth)}" height="${layout.badgeHeight}" rx="${Math.round(layout.badgeHeight / 2)}" fill="${accent}"/>
+        <text x="${layout.x + pad + 19}" y="${layout.y + pad + Math.round(layout.badgeHeight * 0.65)}" font-family="Arial, Helvetica, sans-serif" font-size="${Math.round(layout.badgeHeight * 0.42)}" font-weight="800" fill="${accentText}">${escapeXml(badgeText)}</text>
+        ${headlineLines.map((line, index) =>
+          `<text x="${layout.x + pad}" y="${headlineY + index * headlineGap}" font-family="Arial, Helvetica, sans-serif" font-size="${headlineSize}" font-weight="900" letter-spacing="0" fill="${textColor}">${escapeXml(line)}</text>`
+        ).join('')}
+        ${sublineLines.map((line, index) =>
+          `<text x="${layout.x + pad}" y="${sublineY + index * sublineGap}" font-family="Arial, Helvetica, sans-serif" font-size="${sublineSize}" font-weight="600" fill="${mutedColor}">${escapeXml(line)}</text>`
+        ).join('')}
+        ${price ? `<text x="${layout.x + pad}" y="${priceY}" font-family="Arial, Helvetica, sans-serif" font-size="${Math.round(headlineSize * 0.58)}" font-weight="900" fill="${accent}">${escapeXml(price)}</text>` : ''}
+        ${originalPrice ? `<text x="${layout.x + pad}" y="${priceY + Math.round(headlineSize * 0.52)}" font-family="Arial, Helvetica, sans-serif" font-size="${Math.max(18, Math.round(sublineSize * 0.86))}" font-weight="600" fill="${mutedColor}">${escapeXml(originalPrice)}</text>` : ''}
+        <rect x="${layout.x + pad}" y="${ctaY}" width="${ctaWidth}" height="${ctaHeight}" rx="${Math.round(ctaHeight / 2)}" fill="${creative.palette.primary}"/>
+        <text x="${layout.x + pad + 24}" y="${ctaY + Math.round(ctaHeight * 0.64)}" font-family="Arial, Helvetica, sans-serif" font-size="${Math.max(16, Math.round(ctaHeight * 0.38))}" font-weight="800" fill="${contrastTextColor(creative.palette.primary)}">${escapeXml(cta)}</text>
+        <text x="${layout.x + pad}" y="${layout.y + layout.height - Math.round(pad * 0.45)}" font-family="Arial, Helvetica, sans-serif" font-size="${Math.max(13, Math.round(sublineSize * 0.62))}" font-weight="600" fill="rgba(255,255,255,0.58)">${escapeXml(sourceLabel)}</text>
+      </g>
+    </svg>`;
+
+  return sharp(normalized).composite([{ input: Buffer.from(svg), blend: 'over' }]).jpeg({ quality: 96 }).toBuffer();
+}
+
+function platformDimensions(platform: string): { width: number; height: number } {
+  const dimensions: Record<string, { width: number; height: number }> = {
+    tiktok: { width: 1080, height: 1920 },
+    facebook: { width: 1200, height: 628 },
+    instagram: { width: 1080, height: 1080 },
+    youtube: { width: 1280, height: 720 },
+    zalo: { width: 700, height: 400 },
+  };
+  return dimensions[platform] ?? dimensions.instagram;
+}
+
+function getPipelineBTextLayout(width: number, height: number, platform: string, zone: CreativeDirection['textZone']): {
+  x: number; y: number; width: number; height: number; pad: number;
+  headlineSize: number; minHeadlineSize: number; sublineSize: number; badgeHeight: number;
+} {
+  const basePad = Math.round(Math.min(width, height) * 0.055);
+  const wide = width > height;
+  const leftZone = zone === 'left' || (wide && zone !== 'right');
+  const rightZone = zone === 'right';
+  const verticalTop = zone === 'top';
+  const x = rightZone ? Math.round(width * 0.50) : leftZone ? Math.round(width * 0.04) : Math.round(width * 0.07);
+  const y = verticalTop ? Math.round(height * 0.055) : zone === 'bottom' ? Math.round(height * 0.52) : Math.round(height * 0.11);
+  const boxWidth = wide
+    ? Math.round(width * 0.45)
+    : Math.round(width * 0.88);
+  const boxHeight = wide
+    ? Math.round(height * 0.80)
+    : zone === 'bottom' ? Math.round(height * 0.40) : Math.round(height * 0.42);
+
+  return {
+    x,
+    y,
+    width: Math.min(boxWidth, width - x - Math.round(width * 0.04)),
+    height: Math.min(boxHeight, height - y - Math.round(height * 0.04)),
+    pad: basePad,
+    headlineSize: platform === 'tiktok' ? 74 : wide ? 58 : 62,
+    minHeadlineSize: platform === 'tiktok' ? 42 : 34,
+    sublineSize: platform === 'tiktok' ? 30 : 24,
+    badgeHeight: platform === 'tiktok' ? 46 : 38,
+  };
+}
+
+function buildPipelineBScrim(width: number, height: number, zone: CreativeDirection['textZone']): {
+  x1: string; y1: string; x2: string; y2: string; strong: number; mid: number;
+} {
+  if (zone === 'right') return { x1: '1', y1: '0', x2: '0', y2: '0', strong: 0.76, mid: 0.34 };
+  if (zone === 'top') return { x1: '0', y1: '0', x2: '0', y2: '1', strong: height > width ? 0.74 : 0.62, mid: 0.22 };
+  if (zone === 'bottom') return { x1: '0', y1: '1', x2: '0', y2: '0', strong: 0.78, mid: 0.28 };
+  return { x1: '0', y1: '0', x2: '1', y2: '0', strong: 0.76, mid: 0.34 };
+}
+
+function cleanMarketingTitle(name: string): string {
+  return name
+    .replace(/\[[^\]]+\]/g, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\b(chính hãng|hàng mới|new|authentic|sale|hot|deal|lazada|shopee)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .slice(0, 7)
+    .join(' ');
+}
+
+function titleCaseVi(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/(^|\s)(\S)/g, (_, space: string, char: string) => `${space}${char.toUpperCase()}`);
+}
+
+function limitWords(value: string, maxWords: number): string {
+  const words = value.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  return words.slice(0, maxWords).join(' ');
+}
+
+function formatVnd(value?: number): string {
+  if (!value || value <= 0) return '';
+  return `${Math.round(value).toLocaleString('vi-VN')}đ`;
+}
+
+function socialProofText(product: { rating?: number; sold?: number }): string {
+  const parts: string[] = [];
+  if (product.rating && product.rating > 0) parts.push(`${product.rating.toFixed(1)} sao`);
+  if (product.sold && product.sold > 0) parts.push(`${product.sold.toLocaleString('vi-VN')}+ đã bán`);
+  return parts.join(' · ');
+}
+
 function buildCreativeDirection(niche: string, platform: string, product: VisualProductData): CreativeDirection {
   const palettes: Record<string, CreativeDirection['palette']> = {
-    beauty: { primary: '#EC4899', secondary: '#FDF2F8', accent: '#FDE047', text: '#FFFFFF' },
+    beauty: { primary: '#DB2777', secondary: '#FDF2F8', accent: '#FDE047', text: '#FFFFFF' },
     tech: { primary: '#2563EB', secondary: '#DBEAFE', accent: '#22D3EE', text: '#FFFFFF' },
-    food: { primary: '#F97316', secondary: '#FFF7ED', accent: '#FACC15', text: '#FFFFFF' },
+    food: { primary: '#EA580C', secondary: '#FFF7ED', accent: '#FACC15', text: '#FFFFFF' },
     fashion: { primary: '#7C3AED', secondary: '#F5F3FF', accent: '#F0ABFC', text: '#FFFFFF' },
     home: { primary: '#059669', secondary: '#ECFDF5', accent: '#A7F3D0', text: '#FFFFFF' },
-    health: { primary: '#10B981', secondary: '#ECFEFF', accent: '#67E8F9', text: '#FFFFFF' },
+    health: { primary: '#0D9488', secondary: '#ECFEFF', accent: '#67E8F9', text: '#FFFFFF' },
   };
 
   const themes: Record<string, string[]> = {
-    beauty: ['premium skincare shelfie', 'clinical beauty studio', 'soft luxury vanity scene'],
-    tech: ['premium desk setup', 'clean tech showroom', 'modern device launch scene'],
-    food: ['fresh editorial kitchen', 'bright appetizing product scene', 'clean market-inspired setup'],
+    beauty: ['premium skincare studio with soft light', 'clean vanity counter campaign', 'modern beauty shelf hero scene'],
+    tech: ['premium desk setup with crisp reflections', 'clean tech launch scene', 'modern device showroom'],
+    food: ['fresh editorial kitchen scene', 'bright appetizing product scene', 'clean market-inspired setup'],
     fashion: ['magazine retail campaign', 'boutique product display', 'minimal editorial styling'],
     home: ['warm interior refresh', 'clean lifestyle corner', 'modern home decor scene'],
     health: ['wellness morning routine', 'fresh supplement studio', 'clean active lifestyle scene'],
@@ -576,20 +1290,20 @@ function buildCreativeDirection(niche: string, platform: string, product: Visual
     zalo: 'left',
   };
 
-  const name = shortProductName(product.name);
-  const discountHeadline = product.discount ? `GIAM ${product.discount}%` : 'DANG CHU Y';
+  const name = titleCaseVi(cleanMarketingTitle(product.name));
+  const badge = product.discount ? `Giảm ${product.discount}%` : 'Deal đáng xem';
   const socialProof = product.rating
-    ? `${product.rating.toFixed(1)} sao - ${(product.sold ?? 0).toLocaleString('vi-VN')}+ da ban`
-    : 'Duoc nhieu nguoi quan tam';
+    ? `${product.rating.toFixed(1)} sao - ${(product.sold ?? 0).toLocaleString('vi-VN')}+ đã bán`
+    : 'Được nhiều người quan tâm';
   const benefit = benefitByNiche(niche);
 
   return {
     theme: pickStable(themes[niche] ?? themes.beauty, `${product.name}:${platform}`),
     palette: palettes[niche] ?? palettes.beauty,
-    headline: platform === 'youtube' ? discountHeadline : conciseHeadline(name, niche, platform),
-    subline: platform === 'instagram' ? `${benefit} - ${socialProof}` : `${discountHeadline} - ${benefit}`,
+    headline: platform === 'youtube' ? badge : conciseHeadline(name, niche, platform),
+    subline: platform === 'instagram' ? `${benefit} - ${socialProof}` : `${benefit} - ${socialProof}`,
     cta: platform === 'youtube' ? 'Xem ngay' : 'Xem deal',
-    badge: discountHeadline,
+    badge,
     productPlacement: placementByPlatform[platform] ?? 'center',
     textZone: textZoneByPlatform[platform] ?? 'left',
   };
@@ -612,21 +1326,21 @@ function buildPipelineBMarketingContext(
 }
 
 function conciseHeadline(name: string, niche: string, platform: string): string {
-  if (platform === 'tiktok') return 'DANG THU THAT';
-  if (platform === 'facebook') return 'DEAL DANG XEM';
-  if (platform === 'zalo') return 'UU DAI HOM NAY';
+  if (platform === 'tiktok') return 'Đáng thử thật';
+  if (platform === 'facebook') return 'Deal đáng xem';
+  if (platform === 'zalo') return 'Ưu đãi hôm nay';
   return name || benefitByNiche(niche);
 }
 
 function benefitByNiche(niche: string): string {
   return ({
-    beauty: 'Nang tam routine',
-    tech: 'Gon hon, tien hon',
-    food: 'Ngon va tien loi',
-    fashion: 'De phoi moi ngay',
-    home: 'Nha gon dep hon',
-    health: 'Cham soc moi ngay',
-  } as Record<string, string>)[niche] ?? 'Dang de thu';
+    beauty: 'Nâng tầm routine',
+    tech: 'Gọn hơn, tiện hơn',
+    food: 'Ngon và tiện lợi',
+    fashion: 'Dễ phối mỗi ngày',
+    home: 'Nhà gọn đẹp hơn',
+    health: 'Chăm sóc mỗi ngày',
+  } as Record<string, string>)[niche] ?? 'Đáng để thử';
 }
 
 async function createProductShadow(width: number, height: number): Promise<Buffer> {
@@ -645,15 +1359,15 @@ function getTextZone(width: number, height: number, zone: CreativeDirection['tex
   x: number; y: number; width: number; height: number;
 } {
   if (zone === 'top') {
-    return { x: Math.round(width * 0.06), y: Math.round(height * 0.05), width: Math.round(width * 0.88), height: Math.round(height * 0.28) };
+    return { x: Math.round(width * 0.06), y: Math.round(height * 0.05), width: Math.round(width * 0.88), height: Math.round(height * 0.31) };
   }
   if (zone === 'bottom') {
-    return { x: Math.round(width * 0.06), y: Math.round(height * 0.66), width: Math.round(width * 0.88), height: Math.round(height * 0.28) };
+    return { x: Math.round(width * 0.06), y: Math.round(height * 0.64), width: Math.round(width * 0.88), height: Math.round(height * 0.30) };
   }
   if (zone === 'right') {
-    return { x: Math.round(width * 0.50), y: Math.round(height * 0.12), width: Math.round(width * 0.44), height: Math.round(height * 0.76) };
+    return { x: Math.round(width * 0.52), y: Math.round(height * 0.13), width: Math.round(width * 0.40), height: Math.round(height * 0.70) };
   }
-  return { x: Math.round(width * 0.06), y: Math.round(height * 0.12), width: Math.round(width * 0.44), height: Math.round(height * 0.76) };
+  return { x: Math.round(width * 0.07), y: Math.round(height * 0.13), width: Math.round(width * 0.40), height: Math.round(height * 0.70) };
 }
 
 function wrapText(text: string, maxChars: number, maxLines: number): string[] {
@@ -674,25 +1388,52 @@ function wrapText(text: string, maxChars: number, maxLines: number): string[] {
   return lines.length > 0 ? lines : ['DEAL HOT'];
 }
 
+function fitTextSize(text: string, maxWidth: number, preferred: number, min: number): number {
+  const longestWord = text.split(/\s+/).reduce((longest, word) => Math.max(longest, word.length), 1);
+  const approximateWidth = Math.max(longestWord, Math.min(text.length, 18)) * preferred * 0.58;
+  if (approximateWidth <= maxWidth) return preferred;
+  return Math.max(min, Math.floor(preferred * (maxWidth / approximateWidth)));
+}
+
+function wrapTextByWidth(text: string, maxWidth: number, fontSize: number, maxLines: number): string[] {
+  const maxChars = Math.max(8, Math.floor(maxWidth / (fontSize * 0.55)));
+  return wrapText(text, maxChars, maxLines);
+}
+
+function readableTextColor(color: string): '#FFFFFF' | '#111827' {
+  return relativeLuminance(color) < 0.45 ? '#FFFFFF' : '#111827';
+}
+
+function contrastTextColor(background: string): '#FFFFFF' | '#111827' {
+  return relativeLuminance(background) < 0.55 ? '#FFFFFF' : '#111827';
+}
+
+function relativeLuminance(hex: string): number {
+  const normalized = /^#[0-9a-f]{6}$/i.test(hex) ? hex.slice(1) : '111827';
+  const [r, g, b] = [0, 2, 4].map(offset => parseInt(normalized.slice(offset, offset + 2), 16) / 255)
+    .map(channel => channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
 function shortProductName(name: string): string {
   const cleaned = name
     .replace(/\[[^\]]+\]/g, ' ')
     .replace(/\([^)]*\)/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  return cleaned.split(' ').slice(0, 5).join(' ').toUpperCase() || 'SAN PHAM HOT';
+  return cleaned.split(' ').slice(0, 5).join(' ').toUpperCase() || 'SẢN PHẨM HOT';
 }
 
 function carouselBenefitByNiche(niche: string): string {
   const copy: Record<string, string> = {
-    beauty: 'Cho routine dep hon moi ngay',
-    tech: 'Nang cap setup gon va xin hon',
-    food: 'De an ngon hon ma khong cau ky',
-    fashion: 'De outfit co diem nhan hon',
-    home: 'Lam khong gian gon va dep hon',
-    health: 'Ho tro thoi quen song khoe',
+    beauty: 'Cho routine đẹp hơn mỗi ngày',
+    tech: 'Nâng cấp setup gọn và xịn hơn',
+    food: 'Dễ ăn ngon hơn mà không cầu kỳ',
+    fashion: 'Để outfit có điểm nhấn hơn',
+    home: 'Làm không gian gọn và đẹp hơn',
+    health: 'Hỗ trợ thói quen sống khoẻ',
   };
-  return copy[niche] ?? 'Lua chon dang can nhac hom nay';
+  return copy[niche] ?? 'Lựa chọn đáng cân nhắc hôm nay';
 }
 
 function pickStable<T>(items: T[], seed: string): T {
@@ -775,7 +1516,7 @@ function isNoAudioStreamError(error: unknown): boolean {
   );
 }
 
-async function transcribeVideo(videoPath: string): Promise<{
+async function transcribeVideo(videoPath: string, options: { preferTimestamps?: boolean } = {}): Promise<{
   text: string;
   words: Array<{ word: string; start: number; end: number }>;
   segments: Array<{ text: string; start: number; end: number }>;
@@ -784,20 +1525,157 @@ async function transcribeVideo(videoPath: string): Promise<{
   const { default: OpenAI } = await import('openai');
   const { default: fs } = await import('fs');
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const transcript = await openai.audio.transcriptions.create({
+  const configuredModel = process.env.OPENAI_TRANSCRIPTION_MODEL || 'gpt-4o-transcribe';
+  const model = options.preferTimestamps
+    ? (process.env.OPENAI_SUBTITLE_TRANSCRIPTION_MODEL || (isWhisperTranscriptionModel(configuredModel) ? configuredModel : 'whisper-1'))
+    : configuredModel;
+  const supportsVerboseJson = isWhisperTranscriptionModel(model);
+  const request: Record<string, unknown> = {
     file: fs.createReadStream(videoPath) as any,
-    model: process.env.OPENAI_TRANSCRIPTION_MODEL || 'gpt-4o-transcribe',
+    model,
     language: 'vi',
-    response_format: 'verbose_json',
-    timestamp_granularities: ['word', 'segment'],
-  });
+    response_format: supportsVerboseJson ? 'verbose_json' : 'json',
+  };
+
+  if (supportsVerboseJson) {
+    request.timestamp_granularities = ['word', 'segment'];
+  }
+
+  const transcript = await openai.audio.transcriptions.create(request as any);
+  const text = (typeof transcript === 'string' ? transcript : transcript.text) ?? '';
+  const duration = (transcript as any).duration ?? await getVideoDuration(videoPath).catch(() => 0);
+  const segments = (transcript as any).segments ?? estimateTranscriptSegments(text, duration);
+  const rawWords = (transcript as any).words;
+  const words = Array.isArray(rawWords) && rawWords.length > 0
+    ? rawWords
+    : estimateWordsFromSegments(segments);
 
   return {
-    text:     transcript.text,
-    words:    (transcript as any).words ?? [],
-    segments: (transcript as any).segments ?? [],
-    duration: (transcript as any).duration ?? 0,
+    text,
+    words,
+    segments,
+    duration,
+  };
+}
+
+function isWhisperTranscriptionModel(model: string): boolean {
+  return /^whisper-1(?:$|[-.:])/.test(model.trim().toLowerCase());
+}
+
+function estimateTranscriptSegments(text: string, duration: number): Array<{ text: string; start: number; end: number }> {
+  const clean = text.trim().replace(/\s+/g, ' ');
+  if (!clean) return [];
+
+  const sentences = clean
+    .split(/(?<=[.!?。！？])\s+|\n+/)
+    .map(sentence => sentence.trim())
+    .filter(Boolean);
+  const chunks = sentences.length > 0 ? sentences : [clean];
+  const safeDuration = Number.isFinite(duration) && duration > 0
+    ? duration
+    : Math.max(3, clean.split(/\s+/).length * 0.45);
+  const totalChars = chunks.reduce((sum, chunk) => sum + chunk.length, 0) || clean.length;
+
+  let cursor = 0;
+  return chunks.map((chunk, index) => {
+    const proportional = index === chunks.length - 1
+      ? safeDuration - cursor
+      : (chunk.length / totalChars) * safeDuration;
+    const segmentDuration = Math.max(0.1, proportional);
+    const start = round2(cursor);
+    const end = round2(Math.min(safeDuration, cursor + segmentDuration));
+    cursor = end;
+    return { text: chunk, start, end };
+  }).filter(segment => segment.end > segment.start);
+}
+
+function estimateWordsFromSegments(segments: Array<{ text: string; start: number; end: number }>): Array<{ word: string; start: number; end: number }> {
+  const words: Array<{ word: string; start: number; end: number }> = [];
+  for (const segment of segments) {
+    const parts = segment.text
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter(Boolean);
+    if (parts.length === 0 || segment.end <= segment.start) continue;
+
+    const slot = (segment.end - segment.start) / parts.length;
+    parts.forEach((word, index) => {
+      const start = segment.start + slot * index;
+      const end = index === parts.length - 1
+        ? segment.end
+        : segment.start + slot * (index + 1);
+      words.push({
+        word,
+        start: round2(start),
+        end: round2(Math.max(start + 0.08, end)),
+      });
+    });
+  }
+  return words;
+}
+
+async function transcribeCutClipForSubtitles(
+  clipPath: string,
+  clipAudioPath: string,
+  fallback: {
+    text: string;
+    words: Array<{ word: string; start: number; end: number }>;
+    segments: Array<{ text: string; start: number; end: number }>;
+  } | null
+): Promise<{
+  text: string;
+  words: Array<{ word: string; start: number; end: number }>;
+  segments: Array<{ text: string; start: number; end: number }>;
+} | null> {
+  try {
+    await extractAudioForTranscription(clipPath, clipAudioPath);
+    const transcript = await transcribeVideo(clipAudioPath, { preferTimestamps: true });
+    const duration = await getVideoDuration(clipPath).catch(() => transcript.duration);
+    return normalizeClipTranscriptTiming(transcript, duration);
+  } catch (error) {
+    console.warn(`[Visual] Clip subtitle transcription fallback: ${(error as Error).message}`);
+    return fallback;
+  }
+}
+
+function normalizeClipTranscriptTiming(
+  transcript: {
+    text: string;
+    words: Array<{ word: string; start: number; end: number }>;
+    segments: Array<{ text: string; start: number; end: number }>;
+    duration?: number;
+  },
+  clipDuration: number
+): {
+  text: string;
+  words: Array<{ word: string; start: number; end: number }>;
+  segments: Array<{ text: string; start: number; end: number }>;
+} {
+  const safeDuration = Number.isFinite(clipDuration) && clipDuration > 0
+    ? clipDuration
+    : Math.max(0, transcript.duration ?? 0);
+
+  const segments = transcript.segments
+    .map(segment => ({
+      text: segment.text.trim(),
+      start: round2(clamp(segment.start, 0, safeDuration)),
+      end: round2(clamp(segment.end, 0, safeDuration)),
+    }))
+    .filter(segment => segment.text && segment.end > segment.start);
+
+  const words = transcript.words
+    .map(word => ({
+      word: word.word.trim(),
+      start: round2(clamp(word.start, 0, safeDuration)),
+      end: round2(clamp(word.end, 0, safeDuration)),
+    }))
+    .filter(word => word.word && word.end > word.start);
+
+  return {
+    text: transcript.text,
+    words: words.length > 0 ? words : estimateWordsFromSegments(segments),
+    segments,
   };
 }
 
@@ -862,7 +1740,7 @@ async function findHighlightForClip(transcript: {
   text: string;
   segments: Array<{ text: string; start: number; end: number }>;
   duration?: number;
-}, clipDuration = 45, videoDuration = 45): Promise<{ start: number; end: number; hook_text: string; hook_frame_time?: number }> {
+}, clipDuration = 45, videoDuration = 45): Promise<PipelineCHighlight> {
   const cleanedSegments = transcript.segments
     .filter(segment => segment.text?.trim())
     .map(segment => ({
@@ -926,6 +1804,7 @@ async function findHighlightForClip(transcript: {
       end: Number(parsed.end),
       hook_text: typeof parsed.hook_text === 'string' ? parsed.hook_text : cleanedSegments[0]?.text ?? '',
       hook_frame_time: Number(parsed.hook_frame_time),
+      opening_caption: typeof parsed.opening_caption === 'string' ? parsed.opening_caption : '',
     }, videoDuration, clipDuration);
   } catch {
     return heuristicHighlightFromTranscript(cleanedSegments, videoDuration, clipDuration);
@@ -936,7 +1815,7 @@ async function planPipelineCHighlight(transcript: {
   text: string;
   segments: Array<{ text: string; start: number; end: number }>;
   duration?: number;
-}, clipDuration = 45, videoDuration = 45): Promise<{ start: number; end: number; hook_text: string; hook_frame_time?: number }> {
+}, clipDuration = 45, videoDuration = 45): Promise<PipelineCHighlight> {
   try {
     const plan = await generateVideoEditPlan({
       transcriptText: transcript.text,
@@ -950,6 +1829,7 @@ async function planPipelineCHighlight(transcript: {
       end: Number(plan.end),
       hook_text: typeof plan.hook_text === 'string' ? plan.hook_text : transcript.segments[0]?.text ?? '',
       hook_frame_time: Number(plan.hook_frame_time),
+      opening_caption: typeof plan.opening_caption === 'string' ? plan.opening_caption : '',
     }, videoDuration, clipDuration);
   } catch (error) {
     console.warn(`[Visual] OpenAI video mini-agent fallback: ${(error as Error).message}`);
@@ -958,44 +1838,123 @@ async function planPipelineCHighlight(transcript: {
 }
 
 async function cutVideoClip(input: string, start: number, end: number, output: string, hasAudio = true): Promise<void> {
-  const ffmpeg = await getFfmpeg();
+  const ffmpegPath = await getFfmpegPath();
+  const safeStart = Math.max(0, round2(start));
+  const duration = Math.max(0.5, round2(end - start));
+  const args = [
+    '-y',
+    '-i', input,
+    '-ss', String(safeStart),
+    '-t', String(duration),
+    '-map', '0:v:0',
+    ...(hasAudio ? ['-map', '0:a:0?'] : ['-an']),
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '20',
+    ...(hasAudio ? ['-c:a', 'aac', '-b:a', '160k'] : []),
+    '-avoid_negative_ts', 'make_zero',
+    '-movflags', '+faststart',
+    output,
+  ];
+
   return new Promise((resolve, reject) => {
-    const command = ffmpeg(input)
-      .setStartTime(start)
-      .setDuration(end - start)
-      .outputOptions(hasAudio
-        ? ['-c:v libx264', '-c:a aac', '-preset fast', '-crf 23', '-movflags +faststart']
-        : ['-c:v libx264', '-an', '-preset fast', '-crf 23', '-movflags +faststart'])
-      .output(output)
-      .on('end', () => resolve())
-      .on('error', reject);
-    command.run();
+    execFile(ffmpegPath, args, { windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`ffmpeg video cut failed: ${stderr || stdout || error.message}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function assertVideoWasCut(input: string, expectedDuration: number, label: string): Promise<void> {
+  const actualDuration = await getVideoDuration(input).catch(() => 0);
+  if (!actualDuration) return;
+  const tolerance = Math.max(1.2, expectedDuration * 0.08);
+  if (actualDuration > expectedDuration + tolerance) {
+    throw new Error(`${label} failed: expected about ${round2(expectedDuration)}s, got ${round2(actualDuration)}s`);
+  }
+}
+
+async function ensureVideoDurationLimit(
+  input: string,
+  output: string,
+  maxDuration: number,
+  hasAudio = true
+): Promise<string> {
+  const actualDuration = await getVideoDuration(input).catch(() => 0);
+  if (!actualDuration || actualDuration <= maxDuration + 0.8) return input;
+  await trimVideoToDuration(input, output, maxDuration, hasAudio);
+  await assertVideoWasCut(output, maxDuration, 'Pipeline C final trim');
+  return output;
+}
+
+async function trimVideoToDuration(input: string, output: string, duration: number, hasAudio = true): Promise<void> {
+  const ffmpegPath = await getFfmpegPath();
+  const args = [
+    '-y',
+    '-i', input,
+    '-t', String(Math.max(0.5, round2(duration))),
+    '-map', '0:v:0',
+    ...(hasAudio ? ['-map', '0:a:0?'] : ['-an']),
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '20',
+    ...(hasAudio ? ['-c:a', 'aac', '-b:a', '160k'] : []),
+    '-movflags', '+faststart',
+    output,
+  ];
+
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, args, { windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`ffmpeg final trim failed: ${stderr || stdout || error.message}`));
+        return;
+      }
+      resolve();
+    });
   });
 }
 
 async function processVideoForTikTok(input: string, output: string, hasAudio = true): Promise<void> {
-  const ffmpeg = await getFfmpeg();
+  const ffmpegPath = await getFfmpegPath();
+  const videoFilter = [
+    '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2,eq=brightness=-0.05:saturation=0.9[bg]',
+    '[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]',
+    '[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30,eq=contrast=1.06:saturation=1.08:brightness=0.01,unsharp=5:5:0.55:5:5:0.0,drawbox=x=0:y=0:w=iw:h=260:color=black@0.18:t=fill,drawbox=x=0:y=ih-360:w=iw:h=360:color=black@0.16:t=fill[v]',
+  ].join(';');
+
+  const args = [
+    '-y',
+    '-i', input,
+    '-filter_complex', videoFilter,
+    '-map', '[v]',
+    ...(hasAudio
+      ? [
+          '-map', '0:a:0?',
+          '-af', 'highpass=f=80,lowpass=f=12500,afftdn=nf=-24,dynaudnorm=p=0.9,loudnorm=I=-16:LRA=11:TP=-1.5',
+          '-c:a', 'aac',
+          '-b:a', '160k',
+        ]
+      : ['-an']),
+    '-c:v', 'libx264',
+    '-preset', 'medium',
+    '-crf', '20',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    '-shortest',
+    output,
+  ];
+
   return new Promise((resolve, reject) => {
-    const command = ffmpeg(input)
-      .videoFilters([
-        'scale=1080:1920:force_original_aspect_ratio=decrease',
-        'pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-        'fps=30',
-        'eq=contrast=1.04:saturation=1.08:brightness=0.015',
-        'unsharp=5:5:0.6:5:5:0.0',
-        'drawbox=x=0:y=0:w=iw:h=150:color=black@0.18:t=fill',
-        'drawbox=x=0:y=ih-190:w=iw:h=190:color=black@0.10:t=fill',
-      ])
-      .outputOptions(hasAudio
-        ? ['-c:v libx264', '-c:a aac', '-preset fast', '-crf 23', '-movflags +faststart', '-pix_fmt yuv420p']
-        : ['-c:v libx264', '-an', '-preset fast', '-crf 23', '-movflags +faststart', '-pix_fmt yuv420p'])
-      .output(output)
-      .on('end', () => resolve())
-      .on('error', reject);
-    if (hasAudio) {
-      command.audioFilters(['highpass=f=80', 'lowpass=f=12000', 'afftdn=nf=-25', 'dynaudnorm=p=0.9']);
-    }
-    command.run();
+    execFile(ffmpegPath, args, { windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`ffmpeg video process failed: ${stderr || stdout || error.message}`));
+        return;
+      }
+      resolve();
+    });
   });
 }
 
@@ -1003,9 +1962,11 @@ function generateWordByWordASS(
   words: Array<{ word: string; start: number; end: number }>,
   offsetStart: number,
   outputPath: string,
-  subStyle = 'tiktok'
+  subStyle = 'tiktok',
+  openingCaption = ''
 ): void {
   let content = buildASSHeader(subStyle);
+  content += buildOpeningTitleDialogue(openingCaption);
 
   // Group words into lines of max 4 words
   const lines: Array<Array<typeof words[0]>> = [];
@@ -1036,9 +1997,11 @@ function generateWordByWordASS(
 function generateSegmentASS(
   segments: Array<{ text: string; start: number; end: number }>,
   outputPath: string,
-  subStyle = 'tiktok'
+  subStyle = 'tiktok',
+  openingCaption = ''
 ): void {
   let content = buildASSHeader(subStyle);
+  content += buildOpeningTitleDialogue(openingCaption);
 
   for (const segment of segments) {
     if (!segment.text.trim()) continue;
@@ -1078,7 +2041,7 @@ async function burnSubtitle(video: string, assFile: string, output: string): Pro
   return new Promise((resolve, reject) => {
     ffmpeg(video)
       .videoFilters([`ass='${escapeFfmpegFilterPath(assFile)}'`])
-      .outputOptions(['-movflags +faststart', '-pix_fmt yuv420p'])
+      .outputOptions(['-c:v libx264', '-preset medium', '-crf 20', '-c:a aac', '-b:a 160k', '-movflags +faststart', '-pix_fmt yuv420p'])
       .output(output)
       .on('end', () => resolve())
       .on('error', reject)
@@ -1124,6 +2087,183 @@ async function scrapeProduct(url: string): Promise<{
   throw new Error('Nền tảng này cần fallback HTML parser');
 }
 
+async function preparePipelineBProductReference(images: string[]): Promise<ProductImageCandidate> {
+  if (images.length === 0) throw new Error('Không có ảnh để xử lý');
+
+  const candidates = await inspectProductImageCandidates(images);
+  if (candidates.length === 0) {
+    throw new Error('Không tìm thấy ảnh sản phẩm đủ chất lượng từ URL này');
+  }
+
+  const bestUrl = await selectBestProductImageCandidate(candidates);
+  const selected = candidates.find(candidate => candidate.url === bestUrl) ?? candidates[0];
+  const normalized = await normalizeProductReferenceImage(selected.buffer);
+  return { ...selected, buffer: normalized };
+}
+
+async function inspectProductImageCandidates(images: string[]): Promise<ProductImageCandidate[]> {
+  const uniqueImages = [...new Set(images)].slice(0, 12);
+  const settled = await Promise.allSettled(uniqueImages.map(inspectProductImageCandidate));
+  const candidates = settled
+    .filter((item): item is PromiseFulfilledResult<ProductImageCandidate> => item.status === 'fulfilled')
+    .map(item => item.value)
+    .filter(candidate => isUsableProductImage(candidate))
+    .sort((a, b) => b.score - a.score);
+
+  for (const item of settled) {
+    if (item.status === 'rejected') {
+      console.warn(`[Visual] Pipeline B image candidate skipped: ${item.reason instanceof Error ? item.reason.message : String(item.reason)}`);
+    }
+  }
+
+  return candidates.slice(0, 8);
+}
+
+async function inspectProductImageCandidate(url: string): Promise<ProductImageCandidate> {
+  const { default: sharp } = await import('sharp');
+  const buffer = await downloadBuffer(url);
+  const metadata = await sharp(buffer, { failOn: 'none' }).metadata();
+  const width = metadata.width ?? 0;
+  const height = metadata.height ?? 0;
+  const warnings: string[] = [];
+  const area = width * height;
+  const shortestSide = Math.min(width, height);
+  const longestSide = Math.max(width, height);
+  const ratio = shortestSide > 0 ? longestSide / shortestSide : Number.POSITIVE_INFINITY;
+
+  let score = 0;
+  score += Math.min(area / 1_000_000, 2.5) * 40;
+  score += Math.min(buffer.length / 250_000, 2) * 12;
+  score += ratio <= 1.35 ? 22 : ratio <= 1.8 ? 10 : -28;
+  score += shortestSide >= 900 ? 22 : shortestSide >= 650 ? 15 : shortestSide >= 500 ? 8 : -25;
+
+  const lowerUrl = url.toLowerCase();
+  if (/(?:banner|sprite|logo|avatar|icon|placeholder|default|transparent|loading)/i.test(lowerUrl)) {
+    score -= 55;
+    warnings.push('url_looks_non_product');
+  }
+  if (/(?:thumb|thumbnail|_tn|small|resize|w_?120|w_?240|w_?300|80x80|100x100|200x200)/i.test(lowerUrl)) {
+    score -= 22;
+    warnings.push('url_looks_thumbnail');
+  }
+  if (buffer.length < 25_000) {
+    score -= 30;
+    warnings.push('small_file');
+  }
+  if (shortestSide < 320 || area < 160_000) {
+    warnings.push('low_resolution');
+  }
+  if (ratio > 2.4) {
+    warnings.push('extreme_aspect_ratio');
+  }
+
+  return { url, buffer, width, height, format: metadata.format, score, warnings };
+}
+
+function isUsableProductImage(candidate: ProductImageCandidate): boolean {
+  const area = candidate.width * candidate.height;
+  const shortestSide = Math.min(candidate.width, candidate.height);
+  const longestSide = Math.max(candidate.width, candidate.height);
+  const ratio = shortestSide > 0 ? longestSide / shortestSide : Number.POSITIVE_INFINITY;
+
+  return (
+    candidate.width > 0 &&
+    candidate.height > 0 &&
+    shortestSide >= 320 &&
+    area >= 160_000 &&
+    ratio <= 2.8 &&
+    candidate.buffer.length >= 15_000 &&
+    candidate.score > -10
+  );
+}
+
+async function normalizeProductReferenceImage(buffer: Buffer): Promise<Buffer> {
+  const { default: sharp } = await import('sharp');
+  const metadata = await sharp(buffer, { failOn: 'none' }).metadata();
+  const shortestSide = Math.min(metadata.width ?? 0, metadata.height ?? 0);
+  const shouldUpscale = shortestSide > 0 && shortestSide < 900;
+
+  return sharp(buffer, { failOn: 'none' })
+    .rotate()
+    .resize({
+      width: shouldUpscale ? 1400 : 1600,
+      height: shouldUpscale ? 1400 : 1600,
+      fit: 'inside',
+      withoutEnlargement: !shouldUpscale,
+      kernel: 'lanczos3',
+    })
+    .modulate({ saturation: 1.04, brightness: 1.01 })
+    .sharpen({ sigma: 0.8, m1: 0.8, m2: 1.8 })
+    .png({ compressionLevel: 8, adaptiveFiltering: true })
+    .toBuffer();
+}
+
+async function selectBestProductImageCandidate(candidates: ProductImageCandidate[]): Promise<string> {
+  if (candidates.length === 0) throw new Error('Không có ảnh để xử lý');
+  if (candidates.length === 1) return candidates[0].url;
+
+  if (!process.env.OPENAI_API_KEY) return candidates[0].url;
+
+  const rankedCandidates = candidates.slice(0, 6);
+  try {
+    const { default: OpenAI } = await import('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const response = await withTimeout(
+      () => openai.chat.completions.create({
+        model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_VIDEO_AGENT_MODEL || 'gpt-5.5',
+        response_format: { type: 'json_object' },
+        max_tokens: 180,
+        messages: [
+          {
+            role: 'system',
+            content: [
+              'You are selecting the best source image for an affiliate product ad.',
+              'Pick the image that will work best as the reference for generating a complete premium advertising creative.',
+              'Prefer a single clear product, front-facing packaging, readable label, high resolution, clean edges, minimal clutter, and no people.',
+              'Avoid collages, lifestyle scenes with hands/faces, screenshots, text-heavy promo banners, duplicate products, blurry images, and cropped packaging.',
+              'Return strict JSON only.',
+            ].join(' '),
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: [
+                  'Choose exactly one best candidate.',
+                  'Return JSON shape: {"index": 0, "reason": "single clear product with readable label"}',
+                  'Reject images that are low-resolution, blurry, text-heavy sale banners, collages, thumbnails, placeholders, people/hands lifestyle shots, or cropped product packaging.',
+                  'Candidate images:',
+                ].join('\n'),
+              },
+              ...rankedCandidates.flatMap((candidate, index) => [
+                {
+                  type: 'text',
+                  text: `Candidate ${index}: ${candidate.width}x${candidate.height}, heuristic score ${Math.round(candidate.score)}, warnings ${candidate.warnings.join(', ') || 'none'}`,
+                },
+                { type: 'image_url', image_url: { url: candidate.url, detail: 'low' } },
+              ]),
+            ] as any,
+          },
+        ],
+      } as any),
+      25_000,
+      'Vision image ranking timed out after 25000ms'
+    );
+
+    const content = response.choices[0]?.message?.content ?? '{}';
+    const parsed = JSON.parse(content) as { index?: unknown };
+    const selectedIndex = Number(parsed.index);
+    if (Number.isInteger(selectedIndex) && selectedIndex >= 0 && selectedIndex < rankedCandidates.length) {
+      return rankedCandidates[selectedIndex].url;
+    }
+  } catch (error) {
+    console.warn(`[Visual] Vision image ranking fallback: ${(error as Error).message}`);
+  }
+
+  return rankedCandidates[0].url;
+}
+
 async function rankAndPickBestImage(images: string[]): Promise<string> {
   if (images.length === 0) throw new Error('Không có ảnh để xử lý');
   if (images.length === 1) return images[0];
@@ -1144,7 +2284,7 @@ async function rankAndPickBestImage(images: string[]): Promise<string> {
             role: 'system',
             content: [
               'You are selecting the best source image for an affiliate product ad.',
-              'Pick the image that will work best for background removal and premium product photography.',
+              'Pick the image that will work best as the reference for generating a complete premium advertising creative.',
               'Prefer a single clear product, front-facing packaging, readable label, high resolution, clean edges, minimal clutter, and no people.',
               'Avoid collages, lifestyle scenes with hands/faces, screenshots, text-heavy promo banners, duplicate products, blurry images, and cropped packaging.',
               'Return strict JSON only.',
@@ -1186,15 +2326,15 @@ async function rankAndPickBestImage(images: string[]): Promise<string> {
   return candidates[0];
 }
 
-async function generateCarousel(userId: string, product: VisualProductData, niche: string, productCutout: Buffer): Promise<string[]> {
+async function generateCarousel(userId: string, product: VisualProductData, niche: string, productImageBuffer: Buffer): Promise<string[]> {
   // Tạo 5 slides carousel cho Instagram
   // TODO: implement đầy đủ
   const slides = [
-    { headline: 'LY DO DANG THU', subline: shortProductName(product.name), badge: 'Slide 1/5' },
-    { headline: product.discount ? `TIET KIEM ${product.discount}%` : 'DEAL NOI BAT', subline: product.price ? `${product.price.toLocaleString('vi-VN')}d` : 'Gia tot hom nay', badge: 'Slide 2/5' },
-    { headline: 'REVIEW NHANH', subline: product.rating ? `${product.rating.toFixed(1)} sao - ${(product.sold ?? 0).toLocaleString('vi-VN')}+ da ban` : 'Duoc nhieu nguoi quan tam', badge: 'Slide 3/5' },
-    { headline: 'PHU HOP VOI BAN', subline: carouselBenefitByNiche(niche), badge: 'Slide 4/5' },
-    { headline: 'CHOT DEAL NGAY', subline: 'Bam xem san pham de kiem tra uu dai', badge: 'Slide 5/5' },
+    { headline: 'LÝ DO ĐÁNG THỬ', subline: shortProductName(product.name), badge: 'Slide 1/5' },
+    { headline: product.discount ? `TIẾT KIỆM ${product.discount}%` : 'DEAL NỔI BẬT', subline: product.price ? `${product.price.toLocaleString('vi-VN')}đ` : 'Giá tốt hôm nay', badge: 'Slide 2/5' },
+    { headline: 'REVIEW NHANH', subline: product.rating ? `${product.rating.toFixed(1)} sao - ${(product.sold ?? 0).toLocaleString('vi-VN')}+ đã bán` : 'Được nhiều người quan tâm', badge: 'Slide 3/5' },
+    { headline: 'PHÙ HỢP VỚI BẠN', subline: carouselBenefitByNiche(niche), badge: 'Slide 4/5' },
+    { headline: 'CHỐT DEAL NGAY', subline: 'Bấm xem sản phẩm để kiểm tra ưu đãi', badge: 'Slide 5/5' },
   ];
 
   const urls: string[] = [];
@@ -1209,8 +2349,7 @@ async function generateCarousel(userId: string, product: VisualProductData, nich
         productPlacement: index % 2 === 0 ? 'bottom' : 'right',
         textZone: index % 2 === 0 ? 'top' : 'left',
       };
-      const scene = await generatePhotorealisticProductScene(productCutout, niche, 'instagram', product, creative);
-      const withText = await addCreativeTextOverlay(scene, 'instagram', product, creative);
+      const withText = await generateCompletePipelineBAd(productImageBuffer, niche, 'instagram', product, creative);
       const url = await uploadToStorage(withText, `${userId}/carousel_${index + 1}_${Date.now()}.jpg`);
       urls.push(url);
     } catch (error) {
@@ -1250,46 +2389,62 @@ async function scrapeProductFallback(url: string, existing?: {
   }), 20_000, 'Product page fetch timeout');
 
   if (!res.ok) {
-    throw new Error(`Khong doc duoc trang san pham: HTTP ${res.status}`);
+    throw new Error(`Không đọc được trang sản phẩm: HTTP ${res.status}`);
   }
 
   const html = await res.text();
   const finalUrl = res.url || url;
-  const images = extractProductImages(html, finalUrl);
+  const structured = extractMarketplaceProductData(html, finalUrl);
+  const images = uniqueStrings([
+    ...(structured.images ?? []),
+    ...extractProductImages(html, finalUrl),
+  ]).slice(0, 12);
   if (images.length === 0) {
-    throw new Error('Khong tim thay anh san pham tu URL nay');
+    throw new Error('Không tìm thấy ảnh sản phẩm từ URL này');
   }
 
   const title = decodeHtml(
-    extractMetaContent(html, 'property', 'og:title')
+    structured.name
+    || extractMetaContent(html, 'property', 'og:title')
     || extractMetaContent(html, 'name', 'twitter:title')
     || extractTitleTag(html)
     || existing?.name
-    || 'San pham'
+    || 'Sản phẩm'
   );
 
   const price = parsePriceValue(
-    extractMetaContent(html, 'property', 'product:price:amount')
+    structured.price
+    || extractMetaContent(html, 'property', 'product:price:amount')
     || extractJsonString(html, 'price')
+    || extractJsonString(html, 'salePrice')
+    || extractJsonString(html, 'priceShow')
     || extractJsonString(html, 'price_min')
     || ''
   ) || existing?.price || 0;
 
   const rating = parseNumberValue(
-    extractMetaContent(html, 'property', 'product:rating:value')
+    structured.rating
+    || extractMetaContent(html, 'property', 'product:rating:value')
     || extractJsonString(html, 'ratingValue')
+    || extractJsonString(html, 'average')
     || extractJsonString(html, 'rating_star')
     || ''
   ) || existing?.rating || 0;
 
   const sold = parseIntegerValue(
-    extractJsonString(html, 'historical_sold')
+    structured.sold
+    || extractJsonString(html, 'historical_sold')
+    || extractJsonString(html, 'soldCount')
+    || extractJsonString(html, 'itemSoldCntShow')
     || extractJsonString(html, 'sold')
     || ''
   ) || existing?.sold || 0;
 
   const originalPrice = parsePriceValue(
-    extractJsonString(html, 'price_before_discount')
+    structured.originalPrice
+    || extractJsonString(html, 'price_before_discount')
+    || extractJsonString(html, 'originalPrice')
+    || extractJsonString(html, 'originalPriceShow')
     || extractJsonString(html, 'price_max_before_discount')
     || ''
   ) || existing?.originalPrice || 0;
@@ -1351,7 +2506,7 @@ function mergeScrapedProduct(
   sold: number; originalPrice: number; discount: number;
 } {
   return {
-    name: incoming.name || existing?.name || 'San pham',
+    name: incoming.name || existing?.name || 'Sản phẩm',
     images: incoming.images.length > 0 ? incoming.images : (existing?.images ?? []),
     price: incoming.price || existing?.price || 0,
     rating: incoming.rating || existing?.rating || 0,
@@ -1359,6 +2514,155 @@ function mergeScrapedProduct(
     originalPrice: incoming.originalPrice || existing?.originalPrice || incoming.price || existing?.price || 0,
     discount: incoming.discount || existing?.discount || 0,
   };
+}
+
+function extractMarketplaceProductData(html: string, baseUrl: string): {
+  name?: string;
+  images?: string[];
+  price?: string;
+  originalPrice?: string;
+  rating?: string;
+  sold?: string;
+} {
+  const out: {
+    name?: string;
+    images: string[];
+    price?: string;
+    originalPrice?: string;
+    rating?: string;
+    sold?: string;
+  } = { images: [] };
+
+  for (const json of extractJsonLdBlocks(html)) {
+    const products = Array.isArray(json) ? json : [json];
+    for (const item of products) {
+      if (!item || typeof item !== 'object') continue;
+      const data = item as Record<string, unknown>;
+      const type = String(data['@type'] ?? '').toLowerCase();
+      if (type && !type.includes('product')) continue;
+      out.name ||= firstStringValue(data.name);
+      const image = data.image;
+      if (Array.isArray(image)) out.images.push(...image.map(String));
+      else if (typeof image === 'string') out.images.push(image);
+      const offers = Array.isArray(data.offers) ? data.offers[0] : data.offers;
+      if (offers && typeof offers === 'object') {
+        const offer = offers as Record<string, unknown>;
+        out.price ||= firstStringValue(offer.price, offer.lowPrice, offer.highPrice);
+      }
+      const aggregate = data.aggregateRating;
+      if (aggregate && typeof aggregate === 'object') {
+        out.rating ||= firstStringValue((aggregate as Record<string, unknown>).ratingValue);
+      }
+    }
+  }
+
+  const pageData = extractNextDataJson(html)
+    || extractWindowDataJson(html, '__moduleData__')
+    || extractWindowDataJson(html, '__NEXT_DATA__');
+  if (pageData) {
+    const flat = flattenObject(pageData, 900);
+    out.name ||= firstStringValue(
+      flat.title,
+      flat.name,
+      flat.productTitle,
+      flat.productName,
+      flat.itemTitle,
+    );
+    out.price ||= firstStringValue(flat.price, flat.salePrice, flat.priceShow, flat.salePriceShow, flat.finalPrice);
+    out.originalPrice ||= firstStringValue(flat.originalPrice, flat.originalPriceShow, flat.priceBeforeDiscount, flat.marketPrice);
+    out.rating ||= firstStringValue(flat.ratingValue, flat.ratingScore, flat.average, flat.rating);
+    out.sold ||= firstStringValue(flat.sold, flat.soldCount, flat.itemSoldCntShow, flat.tradeCount);
+  }
+
+  for (const key of ['title', 'name', 'productTitle', 'productName', 'itemTitle']) {
+    out.name ||= extractJsonString(html, key) ?? undefined;
+  }
+  out.price ||= extractJsonString(html, 'salePrice') || extractJsonString(html, 'priceShow') || extractJsonString(html, 'price') || undefined;
+  out.originalPrice ||= extractJsonString(html, 'originalPriceShow') || extractJsonString(html, 'originalPrice') || undefined;
+  out.rating ||= extractJsonString(html, 'ratingValue') || extractJsonString(html, 'average') || undefined;
+  out.sold ||= extractJsonString(html, 'itemSoldCntShow') || extractJsonString(html, 'soldCount') || undefined;
+
+  return {
+    ...out,
+    name: out.name ? decodeHtml(out.name).replace(/\s*[-|]\s*(Shopee|Lazada).*$/i, '').trim() : undefined,
+    images: uniqueStrings(out.images.map(image => normalizeImageUrl(image, baseUrl)).filter((value): value is string => Boolean(value))),
+  };
+}
+
+function extractJsonLdBlocks(html: string): unknown[] {
+  const blocks: unknown[] = [];
+  for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      blocks.push(JSON.parse(decodeHtml(match[1].trim())));
+    } catch {
+      // Ignore invalid marketplace JSON-LD.
+    }
+  }
+  return blocks;
+}
+
+function extractNextDataJson(html: string): unknown | null {
+  const match = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!match) return null;
+  try {
+    return JSON.parse(decodeHtml(match[1].trim()));
+  } catch {
+    return null;
+  }
+}
+
+function extractWindowDataJson(html: string, key: string): unknown | null {
+  const pattern = new RegExp(`${escapeRegExp(key)}\\s*=\\s*({[\\s\\S]*?})\\s*(?:;|<\\/script>)`, 'i');
+  const match = html.match(pattern);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function flattenObject(input: unknown, limit: number): Record<string, string> {
+  const output: Record<string, string> = {};
+  const queue: unknown[] = [input];
+  let visited = 0;
+  while (queue.length > 0 && visited < limit) {
+    visited += 1;
+    const item = queue.shift();
+    if (!item || typeof item !== 'object') continue;
+    if (Array.isArray(item)) {
+      queue.push(...item.slice(0, 20));
+      continue;
+    }
+    for (const [key, value] of Object.entries(item as Record<string, unknown>)) {
+      if (typeof value === 'string' || typeof value === 'number') {
+        output[key] ||= String(value);
+      } else if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
+  }
+  return output;
+}
+
+function firstStringValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    const clean = value.trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    output.push(clean);
+  }
+  return output;
 }
 
 function extractProductImages(html: string, baseUrl: string): string[] {
@@ -1381,13 +2685,17 @@ function extractProductImages(html: string, baseUrl: string): string[] {
     push(match[1]);
   }
 
+  for (const match of html.matchAll(/"(?:imageUrl|mainImage|largeImage|thumb|src)"\s*:\s*"([^"]+)"/gi)) {
+    push(match[1]);
+  }
+
   for (const match of html.matchAll(/"images"\s*:\s*\[(.*?)\]/gi)) {
     for (const nested of match[1].matchAll(/"([^"]+)"/g)) {
       push(nested[1]);
     }
   }
 
-  for (const match of html.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) {
+  for (const match of html.matchAll(/<img[^>]+(?:src|data-src|data-ks-lazyload|data-spm-anchor-id)=["']([^"']+)["']/gi)) {
     push(match[1]);
     if (urls.length >= 8) break;
   }
@@ -1481,7 +2789,14 @@ async function uploadToStorage(buffer: Buffer, path: string, mimeType = 'image/j
 // UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 async function downloadBuffer(url: string): Promise<Buffer> {
-  const res = await withTimeout(() => fetch(url), 15_000, 'Download timeout');
+  const res = await withTimeout(() => fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0 Safari/537.36',
+      'Accept': 'image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8',
+      'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+    },
+    redirect: 'follow',
+  }), 15_000, 'Download timeout');
   if (!res.ok) throw new Error(`Download failed: ${res.status} ${url}`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -1606,6 +2921,7 @@ function buildFallbackHighlight(duration: number, clipDuration: number, hookText
   end: number;
   hook_text: string;
   hook_frame_time: number;
+  opening_caption: string;
 } {
   const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : clipDuration;
   const maxStart = Math.max(0, safeDuration - clipDuration);
@@ -1618,14 +2934,15 @@ function buildFallbackHighlight(duration: number, clipDuration: number, hookText
     end: round2(end),
     hook_text: hookText.trim().slice(0, 120),
     hook_frame_time: round2(Math.min(end - 0.4, start + Math.min(1.5, Math.max(0.8, end - start)))),
+    opening_caption: buildOpeningCaption(hookText),
   };
 }
 
 function normalizeHighlightWindow(
-  highlight: { start?: number; end?: number; hook_text?: string; hook_frame_time?: number },
+  highlight: { start?: number; end?: number; hook_text?: string; hook_frame_time?: number; opening_caption?: string },
   duration: number,
   clipDuration: number
-): { start: number; end: number; hook_text: string; hook_frame_time: number } {
+): PipelineCHighlight {
   const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : clipDuration;
   const maxStart = Math.max(0, safeDuration - Math.max(1, clipDuration));
   const start = clamp(Number.isFinite(highlight.start) ? Number(highlight.start) : 0, 0, maxStart);
@@ -1636,11 +2953,13 @@ function normalizeHighlightWindow(
     start,
     Math.max(start, end - 0.1)
   );
+  const hookText = (highlight.hook_text ?? '').toString().trim().slice(0, 140);
   return {
     start: round2(start),
     end: round2(end),
-    hook_text: (highlight.hook_text ?? '').toString().trim().slice(0, 140),
+    hook_text: hookText,
     hook_frame_time: round2(hookFrame),
+    opening_caption: buildOpeningCaption(highlight.opening_caption || hookText),
   };
 }
 
@@ -1648,7 +2967,7 @@ function heuristicHighlightFromTranscript(
   segments: Array<{ text: string; start: number; end: number }>,
   duration: number,
   clipDuration: number
-): { start: number; end: number; hook_text: string; hook_frame_time: number } {
+): PipelineCHighlight {
   const keywordPattern = /(khong the|không thể|must|nen mua|nên mua|sale|giam|giảm|hot|review|test|ket qua|kết quả|before|after|siêu|xịn|đỉnh|tot hon|tốt hơn|re|wow)/i;
   let bestSegment = segments[0];
   let bestScore = Number.NEGATIVE_INFINITY;
@@ -1746,6 +3065,7 @@ function buildASSHeader(subStyle = 'tiktok'): string {
     karaoke: 'Style: Default,Arial,66,&H00FFF200,&H00000000,&H80000000,1,0,1,3,0,2,20,20,90',
   };
   const assStyle = styleMap[subStyle] ?? styleMap.tiktok;
+  const titleStyle = 'Style: Title,Arial,78,&H00FFFFFF,&H00000000,&H90000000,1,0,1,5,0,8,64,64,160';
 
   return `[Script Info]
 ScriptType: v4.00+
@@ -1755,10 +3075,29 @@ PlayResY: 1920
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,Italic,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV
 ${assStyle}
+${titleStyle}
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 `;
+}
+
+function buildOpeningCaption(text: string): string {
+  const clean = text
+    .replace(/\s+/g, ' ')
+    .replace(/[<>]/g, '')
+    .trim();
+  if (!clean) return '';
+
+  const words = clean.split(' ').filter(Boolean);
+  const short = words.length > 8 ? words.slice(0, 8).join(' ') : clean;
+  return short.replace(/[.!?,;:]+$/g, '').slice(0, 64);
+}
+
+function buildOpeningTitleDialogue(caption: string): string {
+  const clean = buildOpeningCaption(caption);
+  if (!clean) return '';
+  return `Dialogue: 1,0:00:00.00,0:00:02.60,Title,,0,0,0,,{\\fad(120,180)}${escapeAssText(clean.toUpperCase())}\n`;
 }
 
 function escapeAssText(text: string): string {

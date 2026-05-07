@@ -23,7 +23,7 @@ export interface VisualJob {
   source_type?: string;
   source_url?: string;
   product_info: Record<string, unknown>;
-  assets: Record<string, string | string[]>;
+  assets: Record<string, string | string[] | undefined>;
   api_cost_vnd: number;
   created_at: string;
   started_at?: string;
@@ -41,7 +41,7 @@ const PIPELINES: { id: Pipeline; icon: string; label: string; desc: string; tag?
     id: 'B',
     icon: '🛒',
     label: 'URL Shopee / Lazada',
-    desc: 'Paste link sản phẩm — GPT-5.5 chọn ảnh, GPT Image 2 tạo bộ visual',
+    desc: 'Paste link sản phẩm - backend tạo asset theo platform đã chọn',
     tag: 'Phổ biến nhất',
   },
   {
@@ -233,7 +233,7 @@ export default function VisualPageClient({ initialJobs, brandKit }: Props) {
 
           {/* Progress for active job */}
           {processingJob && (
-            <VisualProgress job={processingJob} pipeline={activePipeline} />
+            <VisualProgress job={processingJob} pipeline={processingJob.pipeline} />
           )}
         </div>
 
@@ -286,6 +286,7 @@ function PipelineA({ platforms, brandKit, onJobCreated }: {
   const [preview,   setPreview]   = useState<string | null>(null);
   const [file,      setFile]      = useState<File | null>(null);
   const [niche,     setNiche]     = useState('beauty');
+  const [productDescription, setProductDescription] = useState('');
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     accept: { 'image/*': ['.jpg', '.jpeg', '.png', '.webp'] },
@@ -304,14 +305,21 @@ function PipelineA({ platforms, brandKit, onJobCreated }: {
     if (!file) return;
     setUploading(true);
     try {
-      const result = await visualAPI.uploadPhoto(file, { platforms, niche });
+      const result = await visualAPI.uploadPhoto(file, {
+        platforms,
+        niche,
+        productDescription: productDescription.trim(),
+      });
       // Build optimistic job
       const job: VisualJob = {
         id: result.job_id,
         pipeline: 'A',
         status: 'queued',
         source_type: 'photo_upload',
-        product_info: { niche },
+        product_info: {
+          niche,
+          ...(productDescription.trim() ? { product_description: productDescription.trim() } : {}),
+        },
         assets: {},
         api_cost_vnd: 0,
         created_at: new Date().toISOString(),
@@ -319,6 +327,7 @@ function PipelineA({ platforms, brandKit, onJobCreated }: {
       onJobCreated(job);
       setFile(null);
       setPreview(null);
+      setProductDescription('');
       toast.success('✅ Đang xử lý ảnh...');
     } catch (err) {
       toast.error('Upload thất bại: ' + (err as Error).message);
@@ -384,6 +393,25 @@ function PipelineA({ platforms, brandKit, onJobCreated }: {
         </div>
       </div>
 
+      {/* Product brief */}
+      <div className="space-y-3">
+        <div>
+          <label className="label">Mô tả sản phẩm</label>
+          <textarea
+            className="input min-h-[92px] resize-y text-xs leading-relaxed"
+            value={productDescription}
+            onChange={e => setProductDescription(e.target.value)}
+            maxLength={1200}
+            placeholder="VD: Serum vitamin C cho da xỉn màu, giúp sáng da sau 7 ngày, phù hợp nữ 22-35 tuổi, phong cách banner sạch, cao cấp, nhấn mạnh deal hôm nay."
+          />
+          <div className="mt-1 text-[10px] text-tx-4 text-right">{productDescription.length}/1200</div>
+        </div>
+
+        <div className="rounded-xl border border-bdr-2 bg-bg-3 p-3 text-[11px] leading-relaxed text-tx-4">
+          AI sẽ tự nhận diện sản phẩm trong ảnh, viết headline/subline/CTA phù hợp với niche và render banner hoàn chỉnh cho từng platform.
+        </div>
+      </div>
+
       <button
         onClick={handleProcess}
         disabled={!file || uploading}
@@ -408,35 +436,35 @@ function PipelineA({ platforms, brandKit, onJobCreated }: {
 // ═══════════════════════════════════════════════════════════════════════════════
 const PIPELINE_STEPS: Record<Pipeline, Array<{ icon: string; text: string }>> = {
   B: [
-    { icon: '🔗', text: 'Paste link Shopee/Lazada' },
-    { icon: '🕷',  text: 'AI crawl ảnh sản phẩm' },
-    { icon: '🏆', text: 'Chọn ảnh đẹp nhất (GPT-5.5 Vision)' },
-    { icon: '✂️', text: 'Remove background' },
-    { icon: '🎨', text: 'GPT Image 2 tạo scene lifestyle' },
-    { icon: '✏️', text: 'Thêm giá, CTA, logo' },
-    { icon: '📦', text: 'Export đa format' },
+    { icon: 'URL', text: 'Paste link Shopee/Lazada' },
+    { icon: 'API', text: 'Backend đọc metadata và ảnh sản phẩm' },
+    { icon: 'IMG', text: 'Chọn ảnh nguồn tốt nhất nếu có Vision model' },
+    { icon: 'REF', text: 'Dùng ảnh sản phẩm làm reference' },
+    { icon: 'AI', text: 'Sinh ảnh quảng cáo hoàn chỉnh theo platform' },
+    { icon: 'TXT', text: 'Thêm headline, giá và CTA' },
+    { icon: 'UP', text: 'Upload đúng asset platform đã chọn' },
   ],
   A: [
     { icon: '📸', text: 'Upload ảnh sản phẩm' },
-    { icon: '✂️', text: 'Remove.bg xóa nền chuyên nghiệp' },
-    { icon: '⬆️', text: 'Upscale chất lượng (Real-ESRGAN)' },
-    { icon: '🎨', text: 'GPT Image tạo scene lifestyle hài hòa' },
-    { icon: '🖼',  text: 'Giữ vùng trống sạch cho text overlay' },
-    { icon: '📦', text: 'Export đa format' },
+    { icon: 'TXT', text: 'Nhập niche và mô tả ngắn' },
+    { icon: 'AI', text: 'AI nhận diện sản phẩm và tự viết copy banner' },
+    { icon: '🎨', text: 'GPT Image tạo visual quảng cáo theo ảnh' },
+    { icon: 'LAY', text: 'Render headline, subline và CTA tự động' },
+    { icon: '📦', text: 'Export đúng kích thước từng platform' },
   ],
   C: [
     { icon: '🎬', text: 'Upload video raw' },
-    { icon: '🎙', text: 'Whisper transcribe tiếng Việt' },
-    { icon: '✂️', text: 'AI tìm highlight 45s hay nhất' },
-    { icon: '🔊', text: 'Enhance audio (noise reduction)' },
-    { icon: '💬', text: 'Subtitle word-by-word TikTok style' },
-    { icon: '🖼',  text: 'Extract thumbnail đẹp nhất' },
-    { icon: '📱', text: 'Export 1080×1920 TikTok ready' },
+    { icon: 'TXT', text: 'Transcribe lời thoại và timestamp' },
+    { icon: 'CUT', text: 'AI chọn đoạn có hook mạnh nhất' },
+    { icon: 'LAY', text: 'Dựng 9:16 bằng nền blur fill' },
+    { icon: 'CAP', text: 'Thêm opening title và subtitle' },
+    { icon: 'AUD', text: 'Lọc ồn, cân bằng âm lượng' },
+    { icon: 'UP', text: 'Export 1080x1920 TikTok/Reels' },
   ],
 };
 
 const PIPELINE_TIME: Record<Pipeline, string> = {
-  A: '2-3 phút', B: '3-5 phút', C: '5-7 phút',
+  A: '2-3 phút', B: '1-3 phút', C: '5-7 phút',
 };
 
 const PIPELINE_COST: Record<Pipeline, string> = {
@@ -486,6 +514,7 @@ function BrandKitPreview({ brandKit }: { brandKit: Record<string, unknown> | nul
     brandKit.secondary_color as string ?? '#E8500A',
     brandKit.accent_color as string    ?? '#0E7C7B',
   ];
+  const logoUrl = typeof brandKit.logo_url === 'string' ? brandKit.logo_url : '';
 
   return (
     <div className="card">
@@ -500,9 +529,9 @@ function BrandKitPreview({ brandKit }: { brandKit: Record<string, unknown> | nul
         <div className="text-[11px] text-tx-3">
           Màu sắc sẽ được áp dụng vào text overlay và branding tự động.
         </div>
-        {brandKit.logo_url && (
+        {logoUrl && (
           <div className="flex items-center gap-2 p-2 bg-bg-3 rounded-lg">
-            <img src={brandKit.logo_url as string} alt="Logo" className="h-6 object-contain" />
+            <img src={logoUrl} alt="Logo" className="h-6 object-contain" />
             <span className="text-[11px] text-tx-3">Logo đã cài đặt</span>
           </div>
         )}
